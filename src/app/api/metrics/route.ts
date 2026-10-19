@@ -5,11 +5,15 @@ import { NextResponse } from "next/server";
 import {
   getMetricsSnapshot,
   getEndpointMetrics,
+  getRpcMetricsSnapshot,
+  recordRpcFailoverState,
   LATENCY_BUCKET_BOUNDS,
 } from "@/lib/metrics-counters";
+import { getRpcFailoverState } from "@/lib/rpc-failover";
 import { timingSafeEqual } from "@/lib/crypto";
 import { authenticateRequest } from "@/lib/api-auth";
 import { hasScope, ADMIN_SCOPE } from "@/lib/api-scopes";
+import * as prismaModule from "@/lib/prisma";
 
 /**
  * /api/metrics — Prometheus exposition endpoint.
@@ -77,7 +81,7 @@ function labels(labels: Record<string, string | number>): string {
     .join(",");
 }
 
-function buildMetrics(): string {
+export async function buildMetrics(): Promise<string> {
   const c = getMetricsSnapshot();
 
   const lines: string[] = [
@@ -131,6 +135,16 @@ function buildMetrics(): string {
     `ophirpay_db_query_duration_seconds_sum ${c.db_query_duration_seconds_sum}`,
     `ophirpay_db_query_duration_seconds_count ${c.db_query_duration_seconds_count}`,
     "",
+    "# HELP ophirpay_csp_violation_reports_total Total accepted CSP violation reports",
+    "# TYPE ophirpay_csp_violation_reports_total counter",
+    `ophirpay_csp_violation_reports_total ${c.csp_violation_reports_total}`,
+    "",
+    "# HELP ophirpay_csp_reports_dropped_total Total CSP violation reports dropped by reason",
+    "# TYPE ophirpay_csp_reports_dropped_total counter",
+    `ophirpay_csp_reports_dropped_total{reason="rate_limited"} ${c.csp_reports_dropped.rate_limited}`,
+    `ophirpay_csp_reports_dropped_total{reason="deduplicated"} ${c.csp_reports_dropped.deduplicated}`,
+    `ophirpay_csp_reports_dropped_total{reason="oversized"} ${c.csp_reports_dropped.oversized}`,
+    "",
   ];
 
   // ── Per-endpoint latency histograms + error counts ──────────
@@ -183,6 +197,74 @@ function buildMetrics(): string {
     'ophirpay_info{version="1.0.0"} 1'
   );
 
+  // ── Soroban RPC failover (issue #820) ───────────────────────
+  // Which endpoint is serving, whether we are on a fallback, how many
+  // failovers have occurred and how long the current fallback has lasted.
+  // Sampled on scrape so the gauges track the live failover module state.
+  const failover = getRpcFailoverState();
+  recordRpcFailoverState({
+    failoverCount: failover.failoverCount,
+    recoveryCount: failover.recoveryCount,
+    activeEndpoint: failover.activeEndpoint,
+    primaryEndpoint: failover.primaryEndpoint,
+    usingFallback: failover.usingFallback,
+    currentFallbackDurationMs: failover.currentFallbackDurationMs,
+    longestFallbackDurationMs: failover.longestFallbackDurationMs,
+  });
+  const endpointLabel = failover.activeEndpoint
+    ? `endpoint="${escapeLabelValue(failover.activeEndpoint)}"`
+    : "";
+  lines.push(
+    "",
+    "# HELP ophirpay_rpc_failover_total Cumulative transitions away from the primary Soroban RPC endpoint",
+    "# TYPE ophirpay_rpc_failover_total counter",
+    `ophirpay_rpc_failover_total ${failover.failoverCount}`,
+    "",
+    "# HELP ophirpay_rpc_failover_recoveries_total Cumulative transitions back to the primary Soroban RPC endpoint",
+    "# TYPE ophirpay_rpc_failover_recoveries_total counter",
+    `ophirpay_rpc_failover_recoveries_total ${failover.recoveryCount}`,
+    "",
+    "# HELP ophirpay_rpc_failover_active 1 while serving from a non-primary Soroban RPC endpoint",
+    "# TYPE ophirpay_rpc_failover_active gauge",
+    `ophirpay_rpc_failover_active${endpointLabel ? `{${endpointLabel}}` : ""} ${failover.usingFallback ? 1 : 0}`,
+    "",
+    "# HELP ophirpay_rpc_failover_fallback_duration_seconds Seconds spent on the current fallback endpoint (0 when primary)",
+    "# TYPE ophirpay_rpc_failover_fallback_duration_seconds gauge",
+    `ophirpay_rpc_failover_fallback_duration_seconds ${(failover.currentFallbackDurationMs / 1000).toFixed(3)}`,
+    "",
+    "# HELP ophirpay_rpc_failover_longest_fallback_duration_seconds Longest fallback episode observed since process start",
+    "# TYPE ophirpay_rpc_failover_longest_fallback_duration_seconds gauge",
+    `ophirpay_rpc_failover_longest_fallback_duration_seconds ${(failover.longestFallbackDurationMs / 1000).toFixed(3)}`
+  );
+
+  // ── Soroban RPC performance & requests (issue #1412) ────────
+  const rpcMetrics = getRpcMetricsSnapshot();
+  lines.push(
+    "",
+    "# HELP ophirpay_rpc_request_duration_seconds Latency of Soroban RPC calls in seconds",
+    "# TYPE ophirpay_rpc_request_duration_seconds histogram"
+  );
+  for (let i = 0; i < LATENCY_BUCKET_BOUNDS.length; i++) {
+    const le = LATENCY_BUCKET_BOUNDS[i];
+    lines.push(
+      `ophirpay_rpc_request_duration_seconds_bucket{le="${le}"} ${rpcMetrics.buckets[i]}`
+    );
+  }
+  lines.push(
+    `ophirpay_rpc_request_duration_seconds_bucket{le="+Inf"} ${rpcMetrics.buckets[LATENCY_BUCKET_BOUNDS.length]}`,
+    `ophirpay_rpc_request_duration_seconds_sum ${rpcMetrics.latencySum}`,
+    `ophirpay_rpc_request_duration_seconds_count ${rpcMetrics.latencyCount}`,
+    "",
+    "# HELP ophirpay_rpc_requests_total Total Soroban RPC requests served by status class",
+    "# TYPE ophirpay_rpc_requests_total counter",
+    `ophirpay_rpc_requests_total{status_class="2xx"} ${rpcMetrics.requestsTotal["2xx"]}`,
+    `ophirpay_rpc_requests_total{status_class="5xx"} ${rpcMetrics.requestsTotal["5xx"]}`,
+    "",
+    "# HELP ophirpay_database_pool_wait_seconds Prisma database connection pool queue wait duration in seconds",
+    "# TYPE ophirpay_database_pool_wait_seconds gauge",
+    `ophirpay_database_pool_wait_seconds ${c.database_pool_wait_seconds}`
+  );
+
   // ── Live gauges: process memory + open SSE connections ──────
   // Sampled on scrape so load tests can assert memory stays bounded and
   // that SSE connections are released after clients disconnect.
@@ -203,8 +285,20 @@ function buildMetrics(): string {
     "",
     "# HELP ophirpay_sse_open_connections Currently open SSE event-stream connections",
     "# TYPE ophirpay_sse_open_connections gauge",
-    `ophirpay_sse_open_connections ${c.sse_open_connections}`
+    `ophirpay_sse_open_connections ${c.sse_open_connections}`,
+    "",
+    "# HELP ophirpay_sse_dropped_events_total SSE events shed by the bounded slow-consumer buffer",
+    "# TYPE ophirpay_sse_dropped_events_total counter",
+    `ophirpay_sse_dropped_events_total ${c.sse_dropped_events_total}`
   );
+
+  // ── Database Connection Pool Metrics (#1371) ─────────────────
+  if (typeof prismaModule.getPrismaPrometheusMetrics === "function") {
+    const prismaMetrics = await prismaModule.getPrismaPrometheusMetrics();
+    if (prismaMetrics) {
+      lines.push("", prismaMetrics);
+    }
+  }
 
   return lines.join("\n") + "\n";
 }
@@ -238,7 +332,7 @@ export const GET = withMetrics("GET /api/metrics", async function GET(request: R
     return unauthorizedMetricsResponse();
   }
 
-  return new NextResponse(buildMetrics(), {
+  return new NextResponse(await buildMetrics(), {
     status: 200,
     headers: {
       "Content-Type": "text/plain; version=0.0.4",

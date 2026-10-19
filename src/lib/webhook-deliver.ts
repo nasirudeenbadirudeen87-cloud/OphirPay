@@ -3,7 +3,15 @@
 import { logger } from "@/lib/logger";
 import { incMetric } from "@/lib/metrics-counters";
 import { isSafeWebhookUrlAtDelivery } from "@/lib/webhook-url-guard";
+import { RETRY_CONFIG } from "@/lib/retry-config";
+import {
+  fetchWithTimeout,
+  getWebhookTimeoutMs,
+  isTimeoutError,
+} from "@/lib/timeout";
 import crypto from "crypto";
+import prisma from "@/lib/prisma";
+import type { DeliveryStatus } from "@prisma/client";
 
 export interface WebhookPayload {
   event: string;
@@ -21,28 +29,10 @@ export interface WebhookDeliveryResult {
   errorMessage?: string;
 }
 
-/**
- * Header carrying the delivery timestamp (issue #702). Its value is part of
- * the signed material, so a receiver can trust it for replay protection
- * instead of trusting an unsigned header.
- */
 export const WEBHOOK_TIMESTAMP_HEADER = "X-OphirPay-Timestamp";
-
-/**
- * Advertised freshness window for a delivery, in seconds. Retries reuse the
- * same payload and signature (1s/2s/4s backoff), so any window over ~10s
- * comfortably covers the retry span; 300s additionally absorbs clock skew.
- */
+export const WEBHOOK_SIGNATURE_HEADER = "X-OphirPay-Signature";
 export const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300;
 
-/**
- * The exact byte string the HMAC covers: `<timestamp>.<canonicalBody>`.
- *
- * Binding the timestamp *outside* the JSON body (in addition to it being a
- * field of the body) means the `X-OphirPay-Timestamp` header is authenticated
- * too — a captured delivery cannot be re-dated by editing the header, and a
- * receiver that only trusts the header still verifies the body.
- */
 export function webhookSignedInput(
   timestamp: string,
   canonicalBody: string
@@ -50,26 +40,145 @@ export function webhookSignedInput(
   return `${timestamp}.${canonicalBody}`;
 }
 
-/**
- * Build the canonical string a receiver must sign: the body serialized with
- * the `signature` field emptied (key order preserved).
- */
 export function canonicalizeWebhookBody(payload: WebhookPayload): string {
   return JSON.stringify({ ...payload, signature: "" });
 }
 
-/**
- * Delivery error surfaced when the SSRF guard refuses a target. Kept
- * descriptive so an operator can tell a blocked destination apart from a
- * network failure (issue #706).
- */
 export const BLOCKED_WEBHOOK_TARGET_ERROR =
   "Webhook target rejected by the SSRF guard — URL resolves to a private/internal address or a disallowed port";
 
 /**
- * Generate HMAC-SHA256 signature for a webhook payload.
- * Receiving endpoints can verify authenticity by recomputing the signature.
+ * Compare two signature strings in constant time (issue #1386).
+ *
+ * A plain `===` comparison short-circuits on the first differing byte, which
+ * lets an attacker recover a valid signature byte-by-byte from response-timing
+ * differences. `crypto.timingSafeEqual` does not, but it *throws* on unequal
+ * buffer lengths — so equal encoded length is checked first and a mismatch
+ * returns `false` rather than raising. The comparison is over the UTF-8 bytes
+ * of each string (the hex digests the sender transmits).
  */
+export function constantTimeEqual(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  // Length is not secret (the digest length is fixed), and equal-byte-length
+  // is a hard precondition for timingSafeEqual. Bailing here keeps a malformed
+  // or truncated signature from throwing an uncaught RangeError.
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+/** Why a delivery was accepted or rejected by {@link verifyWebhookSignature}. */
+export type WebhookVerificationReason =
+  | "valid"
+  | "invalid body"
+  | "signature mismatch"
+  | "missing or invalid timestamp"
+  | "payload too old — possible replay"
+  | "payload timestamp is in the future";
+
+export interface WebhookVerificationInput {
+  /** Raw request body, exactly as received. */
+  body: string;
+  /** `X-OphirPay-Signature` header value (the body field is informational). */
+  signature: string | null | undefined;
+  /** The webhook signing secret. */
+  secret: string;
+  /**
+   * `X-OphirPay-Timestamp` header value. Falls back to the (also-signed)
+   * body `timestamp` field when absent.
+   */
+  timestamp?: string | null;
+  /** Replay window in seconds; `0` disables the freshness check. */
+  maxAgeSeconds?: number;
+  /** Reference time in ms epoch for the freshness check (injectable in tests). */
+  now?: number;
+}
+
+export interface WebhookVerificationResult {
+  valid: boolean;
+  reason: WebhookVerificationReason;
+}
+
+/**
+ * Receiver-side verification of an OphirPay webhook delivery (issue #1386).
+ *
+ * Reproduces the exact signed material `buildSignedPayload` produces —
+ * `<timestamp>.<canonical body>` with the `signature` field emptied, not
+ * deleted — then compares the recomputed hex digest against the supplied
+ * signature with a constant-time comparison.
+ *
+ * This is the canonical in-repo receiver: subscriber examples in
+ * `examples/webhook-verification/` mirror it, and the contract is documented in
+ * `docs/webhook-verification.md`. It never throws on malformed input — a
+ * truncated/oversized signature, a non-JSON body or an unparseable timestamp
+ * all yield `{ valid: false, reason }`.
+ *
+ * @example
+ * ```ts
+ * const result = verifyWebhookSignature({
+ *   body: await request.text(),
+ *   signature: request.headers.get("X-OphirPay-Signature"),
+ *   timestamp: request.headers.get("X-OphirPay-Timestamp"),
+ *   secret: process.env.WEBHOOK_SECRET!,
+ * });
+ * if (!result.valid) return new Response("unauthorized", { status: 401 });
+ * ```
+ */
+export function verifyWebhookSignature({
+  body,
+  signature,
+  secret,
+  timestamp,
+  maxAgeSeconds = WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS,
+  now = Date.now(),
+}: WebhookVerificationInput): WebhookVerificationResult {
+  let parsed: WebhookPayload;
+  let canonical: string;
+  try {
+    const raw: unknown = JSON.parse(body);
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return { valid: false, reason: "invalid body" };
+    }
+    parsed = raw as WebhookPayload;
+    // Empty the signature field (do NOT delete the key) — the HMAC covers
+    // `"signature":""` as the last member.
+    canonical = JSON.stringify({ ...parsed, signature: "" });
+  } catch {
+    return { valid: false, reason: "invalid body" };
+  }
+
+  // The timestamp is authenticated (it is prepended to the canonical body), so
+  // the header is safe to trust for replay protection. Prefer the header, fall
+  // back to the body field, which is signed too.
+  const signedTimestamp = String(timestamp ?? parsed.timestamp ?? "");
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(webhookSignedInput(signedTimestamp, canonical))
+    .digest("hex");
+
+  // Constant-time comparison — see constantTimeEqual. Length mismatches return
+  // false without throwing (acceptance criterion of issue #1386).
+  if (!constantTimeEqual(String(signature ?? ""), expected)) {
+    return { valid: false, reason: "signature mismatch" };
+  }
+
+  if (maxAgeSeconds > 0) {
+    const ts = Date.parse(signedTimestamp);
+    if (Number.isNaN(ts)) {
+      return { valid: false, reason: "missing or invalid timestamp" };
+    }
+    const ageSeconds = (now - ts) / 1000;
+    if (ageSeconds > maxAgeSeconds) {
+      return { valid: false, reason: "payload too old — possible replay" };
+    }
+    if (ageSeconds < -maxAgeSeconds) {
+      return { valid: false, reason: "payload timestamp is in the future" };
+    }
+  }
+
+  return { valid: true, reason: "valid" };
+}
+
 export function signWebhookPayload(payload: WebhookPayload, secret: string): string {
   const canonical = canonicalizeWebhookBody(payload);
   return crypto
@@ -78,17 +187,6 @@ export function signWebhookPayload(payload: WebhookPayload, secret: string): str
     .digest("hex");
 }
 
-/**
- * Build the exact HTTP body that will be transmitted and sign it, so a
- * receiver verifying the HMAC over the received body always matches.
- *
- * Canonicalization: the HMAC is computed over
- * `<timestamp>.<body with the signature field emptied>`. A receiver
- * recomputes identically: take the `X-OphirPay-Timestamp` header value, parse
- * the received body, empty the `signature` field, re-serialize (stable key
- * order), prepend the timestamp and a dot, and compare against the
- * `X-OphirPay-Signature` header.
- */
 export function buildSignedPayload(
   payload: WebhookPayload,
   secret: string
@@ -102,99 +200,297 @@ export function buildSignedPayload(
   return { body: JSON.stringify({ ...payload, signature }), signature, timestamp };
 }
 
-/**
- * Deliver a webhook event to a registered endpoint with retries and signing.
- * Returns delivery outcome including HTTP status when available.
- */
+export interface WebhookRequestPreview {
+  canonicalBody: string;
+  body: string;
+  signature: string;
+  headers: Record<string, string>;
+}
+
+export interface WebhookDeliveryDetails extends WebhookDeliveryResult {
+  delivered: boolean;
+  status: number | null;
+  responseBody: string;
+  durationMs: number;
+  blocked: boolean;
+  error: string | null;
+  request: WebhookRequestPreview;
+}
+
+export function buildWebhookRequestPreview(
+  payload: WebhookPayload,
+  secret: string
+): WebhookRequestPreview {
+  const { body, signature, timestamp } = buildSignedPayload(payload, secret);
+  return {
+    canonicalBody: canonicalizeWebhookBody(payload),
+    body,
+    signature,
+    headers: {
+      "Content-Type": "application/json",
+      [WEBHOOK_SIGNATURE_HEADER]: signature,
+      "X-OphirPay-Event": payload.event,
+      [WEBHOOK_TIMESTAMP_HEADER]: timestamp,
+    },
+  };
+}
+
 export async function deliverWebhook(
   url: string,
   secret: string,
   payload: WebhookPayload,
-  maxRetries = 3
-): Promise<WebhookDeliveryResult> {
+  maxRetries: number = RETRY_CONFIG.webhook.maxAttempts
+): Promise<WebhookDeliveryDetails> {
   const startedAt = Date.now();
-  const { body, signature, timestamp } = buildSignedPayload(payload, secret);
-
+  const request = buildWebhookRequestPreview(payload, secret);
   let lastStatusCode: number | undefined;
+  let lastResponseBody = "";
   let lastError: string | undefined;
-  // Number of attempts actually made. A target refused on the first check
-  // records 0; a target that resolves privately on a later retry records the
-  // attempts already spent.
   let attempts = 0;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    // Re-resolve and re-validate immediately before every attempt. DNS can
-    // change between registration and delivery (or between retries), so the
-    // allow/deny decision must be made against the address this attempt is
-    // about to connect to — not once per registration.
     if (!(await isSafeWebhookUrlAtDelivery(url))) {
       logger.error(
         "Webhook delivery blocked — URL resolved to a private/internal address or a disallowed port",
         { url, attempt }
       );
       incMetric("webhooks_failed_total");
+      const latencyMs = Date.now() - startedAt;
       return {
         success: false,
         statusCode: lastStatusCode,
-        latencyMs: Date.now() - startedAt,
+        latencyMs,
         attempts,
         errorMessage: BLOCKED_WEBHOOK_TARGET_ERROR,
+        delivered: false,
+        status: lastStatusCode ?? null,
+        responseBody: lastResponseBody,
+        durationMs: latencyMs,
+        blocked: true,
+        error: BLOCKED_WEBHOOK_TARGET_ERROR,
+        request,
       };
     }
 
     attempts = attempt;
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-OphirPay-Signature": signature,
-          "X-OphirPay-Event": payload.event,
-          // Part of the signed material (see `webhookSignedInput`) — receivers
-          // use it for the replay-freshness window.
-          [WEBHOOK_TIMESTAMP_HEADER]: timestamp,
+      // Explicit, configurable timeout + AbortSignal (issue #747): a hung
+      // endpoint aborts here instead of blocking the request budget.
+      const response = await fetchWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: request.headers,
+          body: request.body,
+          redirect: "manual",
         },
-        body,
-        signal: controller.signal,
-        redirect: "manual",
-      });
-
-      clearTimeout(timeout);
+        { timeoutMs: getWebhookTimeoutMs(), label: "Webhook delivery" }
+      );
+      const responseBody = typeof response.text === "function" ? await response.text() : "";
+      lastResponseBody = responseBody;
       lastStatusCode = response.status;
 
       if (response.ok) {
         logger.info("Webhook delivered", { url, event: payload.event, attempt });
         incMetric("webhooks_delivered_total");
+        const latencyMs = Date.now() - startedAt;
         return {
           success: true,
           statusCode: response.status,
-          latencyMs: Date.now() - startedAt,
+          latencyMs,
           attempts: attempt,
+          delivered: true,
+          status: response.status,
+          responseBody,
+          durationMs: latencyMs,
+          blocked: false,
+          error: null,
+          request,
         };
       }
 
       lastError = `HTTP ${response.status}`;
       logger.warn("Webhook delivery failed", { url, status: response.status, attempt });
     } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
+      lastError = isTimeoutError(err)
+        ? `Webhook delivery timed out after ${getWebhookTimeoutMs()}ms`
+        : err instanceof Error
+          ? err.message
+          : String(err);
       logger.warn("Webhook delivery error", { url, error: lastError, attempt });
     }
 
     if (attempt < maxRetries) {
-      await new Promise((r) => setTimeout(r, Math.pow(2, attempt - 1) * 1000));
+      const delayMs = Math.min(
+        RETRY_CONFIG.webhook.maxDelayMs,
+        RETRY_CONFIG.webhook.baseDelayMs * 2 ** (attempt - 1),
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
     }
   }
 
   logger.error("Webhook delivery exhausted retries", { url, event: payload.event });
   incMetric("webhooks_failed_total");
+  const latencyMs = Date.now() - startedAt;
   return {
     success: false,
     statusCode: lastStatusCode,
-    latencyMs: Date.now() - startedAt,
+    latencyMs,
     attempts: maxRetries,
     errorMessage: lastError ?? "Delivery exhausted retries",
+    delivered: false,
+    status: lastStatusCode ?? null,
+    responseBody: lastResponseBody,
+    durationMs: latencyMs,
+    blocked: false,
+    error: lastError ?? "Delivery exhausted retries",
+    request,
+  };
+}
+
+export async function deliverWebhookWithDetails(
+  url: string,
+  secret: string,
+  payload: WebhookPayload,
+  maxRetries: number = RETRY_CONFIG.webhook.maxAttempts
+): Promise<WebhookDeliveryDetails> {
+  return deliverWebhook(url, secret, payload, maxRetries);
+}
+
+export interface RequeueDeliveryOptions {
+  resetAttempts?: boolean;
+  targetStatus?: DeliveryStatus;
+}
+
+/**
+ * Requeue a dead-lettered or failed webhook delivery (issue #1362).
+ * Resets attempt count to 0 and updates status to PENDING.
+ * Preserves the original event, timestamp, and payload linkage.
+ */
+export async function requeueWebhookDelivery(
+  deliveryId: string,
+  options: RequeueDeliveryOptions = {}
+): Promise<{
+  id: string;
+  status: DeliveryStatus;
+  attempts: number;
+  eventId: string;
+  webhookId: string;
+}> {
+  const resetAttempts = options.resetAttempts ?? true;
+  const targetStatus = options.targetStatus ?? ("PENDING" as DeliveryStatus);
+
+  const updated = await prisma.webhookDelivery.update({
+    where: { id: deliveryId },
+    data: {
+      status: targetStatus,
+      attempts: resetAttempts ? 0 : undefined,
+      errorMessage: null,
+      error: null,
+    },
+    select: {
+      id: true,
+      status: true,
+      attempts: true,
+      eventId: true,
+      webhookId: true,
+    },
+  });
+
+  logger.info("Webhook delivery requeued into DLQ retry pool", {
+    deliveryId: updated.id,
+    webhookId: updated.webhookId,
+    eventId: updated.eventId,
+    status: updated.status,
+  });
+
+  return updated;
+}
+
+export interface DlqFilterParams {
+  statusCodes?: number[];
+  onlyTimeouts?: boolean;
+  limit?: number;
+  deliveryIds?: string[];
+}
+
+/**
+ * Find and bulk-requeue dead-lettered/failed webhook deliveries matching filters.
+ */
+export async function bulkRequeueDlqDeliveries(
+  webhookId: string,
+  filter: DlqFilterParams = {}
+): Promise<{
+  requeuedCount: number;
+  deliveries: Array<{
+    id: string;
+    eventId: string;
+    status: DeliveryStatus;
+    attempts: number;
+  }>;
+}> {
+  const limit = Math.min(Math.max(filter.limit ?? 50, 1), 100);
+
+  // Match deliveries that failed or are dead-lettered
+  const candidates = await prisma.webhookDelivery.findMany({
+    where: {
+      webhookId,
+      status: {
+        in: ["FAILED", "DEAD_LETTER"] as DeliveryStatus[],
+      },
+      ...(filter.deliveryIds && filter.deliveryIds.length > 0
+        ? { id: { in: filter.deliveryIds } }
+        : {}),
+      ...(filter.statusCodes && filter.statusCodes.length > 0
+        ? { responseCode: { in: filter.statusCodes } }
+        : {}),
+      ...(filter.onlyTimeouts
+        ? {
+            OR: [
+              { errorMessage: { contains: "timeout" } },
+              { errorMessage: { contains: "timed out" } },
+              { error: { contains: "timeout" } },
+              { error: { contains: "timed out" } },
+            ],
+          }
+        : {}),
+    },
+    orderBy: { deliveredAt: "desc" },
+    take: limit,
+    select: { id: true, eventId: true },
+  });
+
+  if (candidates.length === 0) {
+    return { requeuedCount: 0, deliveries: [] };
+  }
+
+  const ids = candidates.map((c) => c.id);
+
+  // Perform bulk update to PENDING and reset attempts
+  await prisma.webhookDelivery.updateMany({
+    where: { id: { in: ids } },
+    data: {
+      status: "PENDING" as DeliveryStatus,
+      attempts: 0,
+      errorMessage: null,
+      error: null,
+    },
+  });
+
+  const updatedDeliveries = candidates.map((c) => ({
+    id: c.id,
+    eventId: c.eventId,
+    status: "PENDING" as DeliveryStatus,
+    attempts: 0,
+  }));
+
+  logger.info("Bulk requeued dead-lettered webhook deliveries", {
+    webhookId,
+    requeuedCount: updatedDeliveries.length,
+  });
+
+  return {
+    requeuedCount: updatedDeliveries.length,
+    deliveries: updatedDeliveries,
   };
 }

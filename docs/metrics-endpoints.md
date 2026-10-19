@@ -24,6 +24,16 @@ series instead of one series per concrete id.
 | --- | --- | --- | --- |
 | `ophirpay_endpoint_request_duration_seconds` | histogram | `method`, `endpoint`, `status_class`, `le` | Request latency per endpoint + status class |
 | `ophirpay_endpoint_errors_total` | counter | `method`, `endpoint`, `status_class` | Error counts per endpoint + status class |
+| `ophirpay_rpc_request_duration_seconds` | histogram | `le` | Soroban RPC invocation latency histogram |
+| `ophirpay_rpc_requests_total` | counter | `status_class` | Total Soroban RPC requests served by status class (`2xx`, `5xx`) |
+| `ophirpay_database_pool_wait_seconds` | gauge | — | Prisma connection pool queue wait duration in seconds |
+| `ophirpay_sse_open_connections` | gauge | — | Currently open SSE event-stream connections (both `/api/events` and `/api/audit-log/sse`) |
+| `ophirpay_sse_dropped_events_total` | counter | — | SSE events shed by the bounded slow-consumer buffer (issue #744) |
+
+> **Slow consumers (issue #744).** A rising `ophirpay_sse_dropped_events_total`
+> with a flat `ophirpay_sse_open_connections` means connected clients cannot keep
+> up with the stream and their bounded buffers are shedding data. See
+> `docs/SSE.md` for the drop-oldest policy and the per-connection ceilings.
 
 Example scrape output:
 
@@ -92,3 +102,19 @@ series can be used for latency SLOs and error-rate alerting per route.
   wrapped handler.
 - `src/lib/metrics-counters.ts` holds the storage and serialization helpers
   (`recordEndpointLatency`, `getEndpointMetrics`, `LATENCY_BUCKET_BOUNDS`).
+
+## Application SLI/SLO Alert Rules (issue #1412)
+
+Prometheus alert definitions in `monitoring/prometheus-alerts.yml` cover critical operational SLIs:
+
+| Alert | Severity | Threshold | Runbook |
+| --- | --- | --- | --- |
+| `OphirPayWebhookHighFailureRate` | `warning` | Webhook delivery failure rate > 5% over 5m | [TROUBLESHOOTING.md](TROUBLESHOOTING.md#webhook-high-failure-rate) |
+| `OphirPayRpcProviderDegraded` | `critical` | Soroban RPC p95 latency > 2.5s or 5xx returns for 3m | [TROUBLESHOOTING.md](TROUBLESHOOTING.md#soroban-rpc-provider-degraded) |
+| `OphirPayDatabasePoolExhaustion` | `critical` | Prisma connection pool queue wait > 500ms for 1m | [TROUBLESHOOTING.md](TROUBLESHOOTING.md#database-connection-pool-exhaustion) |
+| `WebhookDeliveryFailureRateHigh` | `warning` | Terminal webhook failures > 25% over 15m for 10m | [TROUBLESHOOTING.md](TROUBLESHOOTING.md#webhook-high-failure-rate) |
+| `RpcFailoverDegraded` | `warning` | Active fallback RPC endpoint for > 2m | [TROUBLESHOOTING.md](TROUBLESHOOTING.md#soroban-rpc-provider-degraded) |
+| `RpcFailoverFrequent` | `warning` | >= 3 RPC failovers in 30m sustained for 5m | [TROUBLESHOOTING.md](TROUBLESHOOTING.md#soroban-rpc-provider-degraded) |
+| `ApiHighErrorRate` | `critical` | Overall endpoint error rate > 5% over 5m | [TROUBLESHOOTING.md](TROUBLESHOOTING.md#-app-runtime) |
+| `ApiDown` | `critical` | Scrape target down for 2m | [TROUBLESHOOTING.md](TROUBLESHOOTING.md#-app-runtime) |
+

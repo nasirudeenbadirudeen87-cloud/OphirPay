@@ -100,4 +100,24 @@ describe("GET /api/health", () => {
     expect(body.data.services.contract.status).toBe("error");
     expect(body.data.services.database.status).toBe("ok");
   });
+
+  it("returns package version and commit SHA from environment", async () => {
+    vi.mocked(prisma.$queryRaw).mockResolvedValueOnce([{ 1: 1 }]);
+    vi.mocked(global.fetch).mockResolvedValue({ ok: true } as Response);
+
+    const prevGitSha = process.env.GIT_SHA;
+    process.env.GIT_SHA = "f93ff410f58ba262fa6d51de6cf300ec8a8cffee";
+    try {
+      const res = await GET(new Request("http://localhost/api/health"));
+      const body = await res.json();
+      expect(body.data.version).toBe("0.1.0");
+      expect(body.data.commit).toBe("f93ff41");
+    } finally {
+      if (prevGitSha !== undefined) {
+        process.env.GIT_SHA = prevGitSha;
+      } else {
+        delete process.env.GIT_SHA;
+      }
+    }
+  });
 });

@@ -14,12 +14,23 @@ permissions:
   contents: read
   pull-requests: write
 
-# ── Global Concurrency — cancel stale runs on same PR ────────
+# ── Global Concurrency — cancel stale runs on same PR (issue #1343) ────────
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  docs-links:
+    name: "Documentation — Markdown Links"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+      - run: npm run check:docs-links
+
   # ══════════════════════════════════════════════════════════════
   # 1. LINT — ESLint with zero tolerance (issue #677)
   #    The `npm run ci` gate runs this exact command; the workflow used to
@@ -31,9 +42,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version-file: '.nvmrc', cache: "npm" }
-      - run: npm ci
+      - uses: ./.github/actions/setup-node-prisma # node-version-file: '.nvmrc'
       - run: npm run lint -- --max-warnings 0
 
   # ══════════════════════════════════════════════════════════════
@@ -45,26 +54,41 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version-file: '.nvmrc', cache: "npm" }
-      - run: npm ci
-      - run: npx prisma generate
+      - uses: ./.github/actions/setup-node-prisma # node-version-file: '.nvmrc'
       - run: npx tsc --noEmit
+      - name: Verify generated API client catalogue is current (issue #822)
+        run: node scripts/generate-api-client.mjs --check
 
   # ══════════════════════════════════════════════════════════════
-  # 3. UNIT TESTS — Vitest (800 frontend tests)
+  # 3. UNIT TESTS — Vitest (3000+ frontend tests)
   # ══════════════════════════════════════════════════════════════
   unit-tests:
     name: "3️⃣ Frontend — Unit Tests (Vitest)"
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The suite is ~3000 tests across ~225 files and does not finish in five
+    # minutes; the old cap killed the runner mid-suite, which reported as a
+    # red job even with every assertion still passing. 30 leaves headroom for a
+    # cold cache without letting a genuinely hung suite burn a runner for an
+    # hour.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version-file: '.nvmrc', cache: "npm" }
-      - run: npm ci
-      - run: npx prisma generate
-      - run: npx vitest run --reporter=verbose
+      - uses: ./.github/actions/setup-node-prisma # node-version-file: '.nvmrc'
+      - name: Run unit tests (4 shards — fresh process per quarter; see vitest.config.ts)
+        # One vitest process accumulates per-file state (jsdom environments,
+        # Prisma engines) across all 226 files and OOMs near the end even
+        # though every assertion passes. Sharding gives each quarter of the
+        # suite a fresh process; shards run sequentially so the check name
+        # (and branch-protection match) is unchanged.
+        run: |
+          set -e
+          for i in 1 2 3 4; do
+            echo "::group::Vitest shard $i/4"
+            npx vitest run --shard=$i/4 --reporter=verbose
+            echo "::endgroup::"
+          done
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
 
   # ══════════════════════════════════════════════════════════════
   # 4. NEXT.JS BUILD — Production build verification (issue #677)
@@ -77,10 +101,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version-file: '.nvmrc', cache: "npm" }
-      - run: npm ci
-      - run: npx prisma generate
+      - uses: ./.github/actions/setup-node-prisma # node-version-file: '.nvmrc'
       - run: npm run build
       - name: Verify build output
         run: |
@@ -127,6 +148,15 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=-s"
         run: cd contracts/emitter && cargo build --target wasm32v1-none --release
+      - name: Run fee assertions and emit fee report
+        run: cargo test --manifest-path contracts/ophirpay/Cargo.toml --test fee_report -- --nocapture
+        env:
+          OPHIRPAY_FEE_REPORT_PATH: ${{ github.workspace }}/fee-report.json
+      - name: Check contract regressions against baseline
+        run: node scripts/check-contract-regressions.mjs
+        env:
+          FEE_REPORT_PATH: fee-report.json
+          REGRESSION_REPORT_PATH: contract-regression-report.md
       - name: Optimize WASM (OphirPay + Emitter)
         run: |
           set -e
@@ -176,6 +206,29 @@ jobs:
           sudo mv gitleaks /usr/local/bin/
       - name: Run Gitleaks detect
         run: gitleaks detect --config .gitleaks.toml --verbose --redact
+      # Stellar seed self-test (issue #1398): the config must extend the default
+      # rules AND catch a Stellar `S…` secret seed. A config that silently
+      # replaces the defaults (no `[extend]`) would pass the scan above while
+      # detecting nothing, so this positive control is what keeps the gate real.
+      - name: Self-test — the Stellar seed rule catches a sample seed
+        run: |
+          set -e
+          tmp="$(mktemp -d)"
+          printf 'STELLAR_SECRET_KEY=S%s\n' "$(printf 'A%.0s' $(seq 1 55))" > "$tmp/sample.txt"
+          set +e
+          # --verbose is required: without it gitleaks prints only the finding
+          # count, not the RuleID this step greps for.
+          gitleaks detect --no-git --source "$tmp" --config .gitleaks.toml \
+            --no-banner --redact --verbose >/tmp/gitleaks-stellar.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 1 ] && grep -q "stellar-secret-seed" /tmp/gitleaks-stellar.log; then
+            echo "✅ Stellar seed rule caught the sample seed (rule: stellar-secret-seed)"
+          else
+            echo "::error::Stellar seed rule did NOT flag a sample seed (exit $rc)"
+            cat /tmp/gitleaks-stellar.log
+            exit 1
+          fi
       # Scanner self-test (issue #393): prove the blocklist catches a sample
       # secret and does not false-positive on clean text. The fixture
       # directory is allowlisted for the repo-wide scan above, so these
@@ -221,6 +274,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/validate-deploy-config.sh
+
+  # ══════════════════════════════════════════════════════════════
+  # 6. MONITORING — validate the shipped Grafana artifact
+  # ══════════════════════════════════════════════════════════════
+  grafana-dashboard:
+    name: "6️⃣ Infra — Grafana Dashboard"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version-file: '.nvmrc', cache: "npm" }
+      - run: node scripts/validate-grafana-dashboard.mjs
 
   # ══════════════════════════════════════════════════════════════
   # 8. HELM LINT — chart lint + render assertions (issue #684)
@@ -301,11 +367,15 @@ jobs:
           expect "kind: NetworkPolicy" /tmp/enabled.yaml
           expect "kind: ServiceAccount" /tmp/enabled.yaml
           expect "policyTypes:" /tmp/enabled.yaml
+          expect "kubernetes.io/metadata.name: monitoring" /tmp/enabled.yaml
+          expect "port: 6379" /tmp/enabled.yaml
 
           reject "kind: HorizontalPodAutoscaler" /tmp/disabled.yaml
           reject "kind: PodDisruptionBudget" /tmp/disabled.yaml
           reject "kind: NetworkPolicy" /tmp/disabled.yaml
           reject "kind: ServiceAccount" /tmp/disabled.yaml
+          reject "kubernetes.io/metadata.name: monitoring" /tmp/disabled.yaml
+          reject "port: 6379" /tmp/disabled.yaml
 
           exit "$fail"
       
@@ -352,4 +422,3 @@ jobs:
             echo "✅ Rendered config keys match .env.example ($(wc -l < /tmp/chart.keys | tr -d ' ') keys)"
           fi
           exit "$fail"
-

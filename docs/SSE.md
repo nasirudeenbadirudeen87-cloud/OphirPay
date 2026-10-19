@@ -8,7 +8,7 @@ OphirPay streams **live blockchain events** to browsers and integrations via
 **Server-Sent Events (SSE)** at `GET /api/events`. The endpoint polls the
 deployed `PaymentEventEmitter` Soroban contract and forwards normalized
 events. A **WebSocket channel** (`/api/events` on port `8787`, see
-[Reconnection & transport](#-reconnection--transport)) delivers the *same*
+[docs/WEBSOCKET.md](WEBSOCKET.md) and [Reconnection & transport](#reconnection--transport)) delivers the *same*
 events with lower latency; the official client prefers it and falls back to
 SSE automatically.
 
@@ -79,7 +79,19 @@ time out an idle stream.
 {"timestamp": 1724000000000}
 ```
 
-### 3. `payment:created`
+### 3. `error`
+
+Emitted only when a slow consumer is disconnected (see
+[Backpressure & slow consumers](#backpressure--slow-consumers-issue-744)). Clients
+should treat it as terminal and reconnect.
+
+| Field | Type | Description |
+|---|---|---|
+| `code` | `string` | Always `"SLOW_CONSUMER"` |
+| `reason` | `string` | `"buffer-overflow"` or `"idle-timeout"` |
+| `message` | `string` | Human-readable explanation |
+
+### 4. `payment:created`
 
 A new payment event detected on-chain. This is the normalized `LiveEvent`
 shape — identical across SSE and WebSocket transports.
@@ -163,11 +175,44 @@ The client exposes a status enum — useful for UI indicators:
 | `fallback` | Switched to SSE (WS unavailable/exhausted) |
 | `offline` | SSE connection error (native reconnection still active) |
 
+## Backpressure & slow consumers (issue #744)
+
+A `ReadableStream` controller queues whatever is `enqueue()`d whether or not
+the client reads, so a stalled consumer could otherwise grow server memory
+without bound. Both SSE endpoints therefore route every frame through a
+**bounded outbound buffer** (`src/lib/events/sse-buffer.ts`):
+
+| Bound | Default |
+|---|---|
+| Buffered events per connection | `100` |
+| Buffered bytes per connection | `256 KiB` |
+| Idle timeout (backlog not draining) | `60 s` |
+
+**Policy — drop-oldest with a marker.** When a new frame would exceed either
+ceiling, the oldest buffered frames are dropped and a `: dropped N
+slow-consumer event(s)` SSE **comment** is emitted ahead of the next data frame.
+Comments are ignored by `EventSource`, so the client protocol is unchanged;
+tail the raw stream (`curl -N`) to see the marker. Server-side, each dropped
+frame increments `ophirpay_sse_dropped_events_total` on `/api/metrics`.
+
+Separately, a connection whose backlog has not drained within the idle budget
+is treated as stalled and closed with the `error` frame (`reason:
+"idle-timeout"`). Clients that overflow under the `disconnect` policy (used by
+tests) receive `error` with `reason: "buffer-overflow"`.
+
+The WebSocket channel applies the same idea per client: a socket whose outbound
+buffer exceeds the byte ceiling is dropped rather than buffered without bound.
+
+Heartbeats still fire every 15 s, and the `ophirpay_sse_open_connections` gauge
+is decremented exactly once per connection on teardown, so it returns to its
+baseline after disconnects.
+
 ## Errors & edge cases
 
 | Situation | Behavior |
 |---|---|
 | RPC/emitter down during a poll | Poll fails silently; retried on the next 10 s cycle |
+| Slow/stalled consumer | Oldest buffered frames dropped with a marker comment (drop-oldest policy); memory stays bounded. A backlog idle for >60 s is disconnected with an `error` frame. |
 | Truncated or non-JSON frame | Frame ignored (client catches parse errors) |
 | Event seen twice after reconnect | Dropped — dedup by `id` (window: last 1000 ids) |
 | WS server not running | Client falls back to SSE automatically (expected in dev) |
@@ -265,7 +310,12 @@ curl -N https://ophirpay.com/api/events | \
   to `0` and fresh connections still work afterwards;
 - **memory stays bounded** — server heap/RSS deltas sampled from
   `/api/metrics` during the run, and the harness's own heap, must stay under
-  generous limits.
+  generous limits;
+- **stalled consumers stay bounded** (issue #744) — a phase opens
+  `STALLED_CLIENTS` (default `25`) connections that never read their body,
+  asserts server memory stays bounded while they are stalled, then disconnects
+  them and asserts the `ophirpay_sse_open_connections` gauge returns to `0`.
+  Override with `STALLED_CLIENTS` / `STALLED_DURATION_MS`.
 
 The load test samples `/api/metrics` for the leak and memory gauges, so pass
 `METRICS_TOKEN` for the target deployment (otherwise those assertions are
@@ -290,7 +340,7 @@ the production build is served).
 - Route: `src/app/api/events/route.ts`
 - Shared event source & types: `src/lib/events/event-source.ts`
 - Client with transport fallback: `src/lib/events/event-client.ts`
-- WebSocket server: `src/lib/events/live-events-ws-server.ts`
+- WebSocket server: `src/lib/events/live-events-ws-server.ts` (see [docs/WEBSOCKET.md](WEBSOCKET.md))
 - Live events page: `src/app/events/page.tsx`
 
 ---

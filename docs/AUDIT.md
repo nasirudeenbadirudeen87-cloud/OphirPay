@@ -135,9 +135,10 @@ badge reads "verified-Kani". The reality:
    `compute_vested_boundary_at_start`, and `compute_vested_zero_duration` instead.
 4. **Not run in CI.** No job in `.github/workflows/ci.yml` installs or runs Kani; the "green"
    badge is decorative.
-5. **The docs contradict each other.** `docs/SPEC.md` still lists Kani as an *unchecked TODO*
-   (`- [ ] Bounded model checking with kani …`), while `ROADMAP.md` marks it *done* ("10/10 Kani
-   proofs passing"). The proof file header says "8 critical invariants"; the README says 10.
+5. **The verification status was inconsistent.** The original `docs/SPEC.md` wording
+   described a generic Kani TODO while `ROADMAP.md` reported that 10 model proofs existed.
+   The current SPEC and roadmap now both distinguish those model proofs from verification of
+   the deployed contract, which remains pending.
 
 Additionally, at least one modeled invariant does **not** hold in the actual code: invariant 8
 (spending-limit expiry) is modeled correctly, but the real `check_spending` (L1867) never checks
@@ -333,8 +334,9 @@ and re-run the IP/hostname check against the final resolved address after follow
 - `execute_timelocked_action`, `execute_upgrade`, and `process_refund` are permissionless
   executors (acceptable *only* when the payload is owner-approved and the action is
   content-bound, which is true for upgrade but **not** for refund).
-- `record_payment` and the emitter's `emit_payment` are permissionless recorders; ensure
-  downstream consumers treat on-chain records as *untrusted* for fund movement.
+- `record_payment` and the emitter's `emit_payment` are record-only public paths; downstream
+  consumers must still treat on-chain records as *untrusted* for fund movement. `record_payment`
+  now deduplicates retries by payer + `tx_hash` and rejects payload changes under the same key.
 - `src/lib/auth-session.ts` still describes proof-of-ownership as a *future* hardening step, but
   the issuing route (`src/app/api/auth/session/route.ts`) already enforces the challenge +
   Ed25519-signature flow. Stale comment only — the protection is present.
@@ -395,3 +397,51 @@ This is an AI-assisted manual review performed on the source as of the reference
 a formal verification, not a security guarantee, and not a replacement for a professional audit by
 a qualified firm with dynamic analysis, fuzzing, and economic review. No funds should be deployed
 to mainnet solely on the basis of this report.
+
+---
+
+## 7. Post-audit web-layer findings (2026-09-28)
+
+### WEB-1 — CSP `script-src` retains `'unsafe-inline'`; nonce propagation not confirmed (issue #697)
+
+**File:** `src/proxy.ts` (`buildCsp`), `src/app/layout.tsx`
+
+**Status:** ✅ Fixed (2026-09-30, issue #1257) — re-tested on next@16.3.4.
+
+**Resolution:** the nonce never "failed to propagate" in Next itself — the App Router renderer
+reads the nonce from the *request* `content-security-policy` header
+(`next/dist/server/app-render/app-render.js`, `getScriptNonceFromHeader`), but the proxy only set
+the CSP on the *response*. `src/proxy.ts` now generates a per-request nonce, sets the CSP on both
+the forwarded request headers and the response, and forwards `x-nonce` so `src/app/layout.tsx`
+tags its own inline scripts. Production `script-src` is now
+`'self' 'nonce-…' 'strict-dynamic' 'wasm-unsafe-eval'` with no `'unsafe-inline'`; browser check
+on a production build showed `nonce="…"` on every framework inline script and hydration with no
+CSP violation reports. `src/__tests__/config-drift.test.ts` and
+`src/__tests__/csp-nonce.test.ts` guard the new directive set. Re-verify on each Next minor bump.
+
+**Original finding:**
+
+`buildCsp()` produces `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'` in production.
+The intended mitigation is a per-request nonce: Next generates a fresh value per request and
+embeds it in its inline hydration scripts; the proxy propagates the same nonce in the CSP header
+so browsers accept the framework scripts while rejecting injected ones.  In this Next 16 build
+the nonce does **not** propagate reliably from the middleware layer to the App Router renderer,
+so removing `'unsafe-inline'` causes hydration failures.  The limitation is now documented in
+`SECURITY.md` and the inaccurate comment in `src/proxy.ts` has been corrected.  A follow-up
+task should re-test nonce propagation on each Next minor release and remove `'unsafe-inline'`
+once propagation is confirmed end-to-end.
+
+**Risk:** Without a functioning nonce or hash-based allow-list, the `script-src` directive does
+not provide XSS protection for injected inline scripts.  All other directives (`default-src
+'self'`, `connect-src` restricted to Stellar endpoints, `object-src 'none'`, etc.) remain strict.
+
+### WEB-2 — No CSP violation reporting endpoint (issue #698)
+
+**Status:** ✅ Fixed (2026-09-28).
+
+Added `report-to csp-endpoint` and `report-uri /api/csp-report` to the CSP directive in
+`buildCsp()`, plus `Report-To` and `Reporting-Endpoints` response headers.  The collector at
+`POST /api/csp-report` accepts both `application/csp-report` (legacy) and
+`application/reports+json` (Reporting API) formats, caps bodies at 16 KiB, logs a redacted
+structured line via `logger.ts` (no cookies, tokens, or PII), and increments
+`csp_violation_reports_total` in `metrics-counters.ts`.

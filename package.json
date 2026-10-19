@@ -4,7 +4,7 @@
   "private": true,
   "packageManager": "npm@10.8.2",
   "engines": {
-    "node": "20.x"
+    "node": "24.x"
   },
   "description": "Open-source payment orchestration layer for Stellar — smart contracts, webhooks, batch payments, refunds, multisig, governance, and real-time event streaming",
   "homepage": "https://ophirpay.vercel.app",
@@ -38,6 +38,9 @@
   ],
   "scripts": {
     "preinstall": "node scripts/check-node.mjs",
+    "prepare": "node scripts/install-git-hooks.mjs",
+    "secrets:scan": "gitleaks detect --config .gitleaks.toml --redact",
+    "secrets:precommit": "bash scripts/pre-commit-secrets.sh",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
@@ -57,18 +60,27 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:openapi": "vitest run src/__tests__/openapi-conformance.test.ts",
-    "typecheck": "tsc --noEmit",
-    "ci": "npm run typecheck && npm run lint -- --max-warnings 0 && npm test && npm run build && bash scripts/validate-deploy-config.sh",
+    "check:docs-links": "node scripts/check-markdown-links.mjs",
+    "typecheck": "tsc --noEmit && npx tsx scripts/regenerate-errors.ts --check",
+    "ci": "npm run typecheck && npm run lint -- --max-warnings 0 && npm run client:check && npm test && npm run build && bash scripts/validate-deploy-config.sh",
     "audit:deps": "node scripts/audit-dependencies.mjs",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "test:visual": "playwright test -c playwright.visual.config.ts",
     "test:visual:update": "playwright test -c playwright.visual.config.ts --update-snapshots",
     "test:a11y": "playwright test e2e/accessibility.spec.ts",
-    "generate-errors": "tsx scripts/regenerate-errors.ts"
+    "generate-errors": "npx tsx scripts/regenerate-errors.ts",
+    "client:generate": "node scripts/generate-api-client.mjs",
+    "client:check": "node scripts/generate-api-client.mjs --check",
+    "changelog": "node scripts/generate-changelog.mjs",
+    "cli": "node scripts/ophirpay-cli.mjs"
   },
   "dependencies": {
+    "@ledgerhq/hw-app-str": "^7.8.0",
+    "@ledgerhq/hw-transport-webusb": "^6.35.0",
     "@prisma/client": "^6.5.0",
+    "@scalar/nextjs-api-reference": "^0.12.11",
+    "@sentry/nextjs": "^11.1.0",
     "@stellar/freighter-api": "^4.0.0",
     "@stellar/stellar-sdk": "^13.2.0",
     "@tanstack/react-query": "^5.101.4",
@@ -80,6 +92,14 @@
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/auto-instrumentations-node": "^0.80.0",
+    "@opentelemetry/core": "^2.11.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.222.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.222.0",
+    "@opentelemetry/sdk-metrics": "^2.11.0",
+    "@opentelemetry/sdk-node": "^0.222.0",
     "ioredis": "^5.11.1"
   },
   "devDependencies": {

@@ -23,6 +23,8 @@
  * With neither configured the in-memory store is used, exactly as before.
  */
 
+import { sanitizeRateLimitKey } from "@/lib/client-ip";
+
 // ── Interface ──────────────────────────────────────────────────
 
 export interface RateLimitResult {
@@ -72,15 +74,16 @@ export class InMemoryRateLimitStore implements RateLimitStore {
     windowMs: number,
     maxRequests: number
   ): Promise<RateLimitResult> {
+    const safeKey = sanitizeRateLimitKey(key);
     const now = Date.now();
-    let entry = this.store.get(key);
+    let entry = this.store.get(safeKey);
 
     if (!entry || entry.resetAt < now) {
       entry = { count: 0, resetAt: now + windowMs };
     }
 
     entry.count++;
-    this.store.set(key, entry);
+    this.store.set(safeKey, entry);
 
     // Periodic cleanup — prevent unbounded memory growth under abuse
     if (this.store.size > 10_000) {
@@ -94,7 +97,7 @@ export class InMemoryRateLimitStore implements RateLimitStore {
   }
 
   async reset(key: string): Promise<void> {
-    this.store.delete(key);
+    this.store.delete(sanitizeRateLimitKey(key));
   }
 }
 
@@ -115,12 +118,13 @@ export class RedisRateLimitStore implements RateLimitStore {
     windowMs: number,
     maxRequests: number
   ): Promise<RateLimitResult> {
+    const safeKey = sanitizeRateLimitKey(key);
     const now = Date.now();
     const ttl = Math.ceil(windowMs / 1000);
 
-    const count = await this.redis.incr(key);
+    const count = await this.redis.incr(safeKey);
     if (count === 1) {
-      await this.redis.expire(key, ttl);
+      await this.redis.expire(safeKey, ttl);
     }
 
     const remaining = Math.max(0, maxRequests - count);
@@ -128,7 +132,7 @@ export class RedisRateLimitStore implements RateLimitStore {
   }
 
   async reset(key: string): Promise<void> {
-    await this.redis.del(key);
+    await this.redis.del(sanitizeRateLimitKey(key));
   }
 }
 
@@ -188,14 +192,15 @@ export class HttpRedisRateLimitStore implements RateLimitStore {
     windowMs: number,
     maxRequests: number
   ): Promise<RateLimitResult> {
+    const safeKey = sanitizeRateLimitKey(key);
     const now = Date.now();
     const ttl = Math.ceil(windowMs / 1000);
 
     // INCR is atomic on the Redis side, so every replica observes the same
     // counter — this is what makes the limit global across instances.
-    const count = Number(await this.command(["INCR", key]));
+    const count = Number(await this.command(["INCR", safeKey]));
     if (count === 1) {
-      await this.command(["EXPIRE", key, ttl]);
+      await this.command(["EXPIRE", safeKey, ttl]);
     }
 
     const remaining = Math.max(0, maxRequests - count);
@@ -203,7 +208,7 @@ export class HttpRedisRateLimitStore implements RateLimitStore {
   }
 
   async reset(key: string): Promise<void> {
-    await this.command(["DEL", key]);
+    await this.command(["DEL", sanitizeRateLimitKey(key)]);
   }
 }
 
@@ -306,8 +311,7 @@ export async function initRateLimitStore(): Promise<void> {
   if (redisUrl && TCP_REDIS_URL.test(redisUrl)) {
     try {
       // Dynamic import — ioredis is an optional dependency, absent on the edge.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const RedisModule: any = await import("ioredis");
+      const RedisModule = await import("ioredis");
       const redis = new RedisModule.Redis(redisUrl, {
         maxRetriesPerRequest: 3,
         lazyConnect: true,
@@ -327,4 +331,71 @@ export async function initRateLimitStore(): Promise<void> {
 
   // 3. In-memory.
   _store = createRateLimitStoreFromEnv();
+}
+
+/** Rate limit window for CSP reports (1 minute in milliseconds, issue #1392). */
+export const CSP_REPORT_RATE_LIMIT_WINDOW_MS = 60_000;
+
+/** Maximum CSP violation reports allowed per client per minute (#1392). */
+export const CSP_REPORT_RATE_LIMIT_MAX = 60;
+
+// ── API key lifecycle quotas (#1370) ───────────────────────────
+//
+// Creating and rotating API keys are privileged, low-frequency operations.
+// Each call mints a credential and (for rotation) writes a replacement row, so
+// an authenticated client stuck in a retry loop can inflate the ApiKey table
+// and leave a trail of live credentials. A dedicated per-account bucket keeps
+// that blast radius small without throttling the rest of the API.
+//
+// The bucket is deliberately shared by create *and* rotate: they cost the same
+// and must not be usable as two independent escape hatches.
+
+/** Sliding window for API-key create/rotate operations (1 hour). */
+export const API_KEY_MUTATION_WINDOW_MS = 60 * 60 * 1000;
+
+/** Maximum create/rotate operations per account per window. */
+export const API_KEY_MUTATION_MAX = 10;
+
+/** Maximum simultaneously active (unrevoked, unrotated, unexpired) keys. */
+export const MAX_ACTIVE_API_KEYS = 5;
+
+export interface ApiKeyMutationQuota {
+  /** Whether the operation may proceed. */
+  allowed: boolean;
+  /** The configured per-window maximum. */
+  limit: number;
+  /** Operations left in the current window (0 once exhausted). */
+  remaining: number;
+  /** Unix-ms timestamp when the window resets. */
+  resetAt: number;
+}
+
+/**
+ * Charge one API-key mutation (create or rotate) against the account's
+ * hourly quota.
+ *
+ * Keyed by user id — the account is the tenant boundary in OphirPay, so two
+ * sessions or API keys belonging to the same user share one bucket. Callers
+ * must still authenticate first: the quota never replaces auth, it only
+ * bounds authenticated abuse.
+ *
+ * @param userId Account to charge.
+ * @param store  Injectable store (defaults to the process-wide backend).
+ */
+export async function consumeApiKeyMutationQuota(
+  userId: string,
+  store: RateLimitStore = getRateLimitStore()
+): Promise<ApiKeyMutationQuota> {
+  const result = await store.increment(
+    `apikeys:mutation:${userId}`,
+    API_KEY_MUTATION_WINDOW_MS,
+    API_KEY_MUTATION_MAX
+  );
+
+  return {
+    allowed: result.allowed,
+    limit: API_KEY_MUTATION_MAX,
+    remaining: result.remaining,
+    resetAt: result.resetAt,
+  };
 }

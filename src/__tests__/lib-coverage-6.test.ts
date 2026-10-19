@@ -73,6 +73,24 @@ describe('form-helpers', () => {
       await p1;
     });
 
+    it('blocks repeated submissions in the same synchronous tick', async () => {
+      let resolvePromise: (() => void) | undefined;
+      const handler = vi.fn().mockImplementation(
+        () => new Promise<void>((resolve) => {
+          resolvePromise = resolve;
+        })
+      );
+      const { result } = renderHook(() => useFormSubmit(handler));
+
+      await act(async () => {
+        result.current.submit();
+        result.current.submit();
+      });
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      resolvePromise?.();
+    });
+
     it('resets isSubmitting after completion', async () => {
       const handler = vi.fn().mockResolvedValue(undefined);
       const { result } = renderHook(() => useFormSubmit(handler));
@@ -348,9 +366,14 @@ describe('crypto', () => {
 // ═══════════════════════════════════════════════════════════════
 describe('email', () => {
   describe('sendEmail', () => {
-    it('returns a boolean in dev mode', async () => {
-      const result = await sendEmail({ to: 't@t.com', subject: 'S', html: '<p>B</p>' });
-      expect(typeof result).toBe('boolean');
+    it('fails loudly when RESEND_API_KEY is not configured', async () => {
+      vi.stubEnv('RESEND_API_KEY', '');
+      try {
+        await expect(sendEmail({ to: 't@t.com', subject: 'S', html: '<p>B</p>' }))
+          .rejects.toThrow(/RESEND_API_KEY/);
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
   });
 

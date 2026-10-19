@@ -283,7 +283,7 @@ proptest! {
     #[test]
     fn prop_stream_full_vesting_conservation(
         total_amount in 1_000i128..=500_000_000i128,
-        duration in 50u64..=5_000u64,
+        duration in 60u64..=5_000u64,
     ) {
         let h = PropHarness::new();
         let creator = Address::generate(&h.env);
@@ -315,6 +315,51 @@ proptest! {
         prop_assert_eq!(h.client.get_locked_balance(), 0);
         prop_assert_eq!(h.token_client.balance(&h.contract_id), 0);
         prop_assert_eq!(h.token_client.balance(&recipient), total_amount);
+    }
+
+    /// Solvency and exact conservation verification across arbitrary start times,
+    /// durations, and elapsed cancellation points (Issue #1357).
+    #[test]
+    fn prop_stream_cancellation_prorata_solvency(
+        total_amount in 100i128..=1_000_000_000i128,
+        duration in 10u64..=100_000u64,
+        elapsed in 0u64..=150_000u64,
+    ) {
+        let h = PropHarness::new();
+        let creator = Address::generate(&h.env);
+        let recipient = Address::generate(&h.env);
+
+        h.mint(&creator, total_amount);
+
+        let start_time = h.env.ledger().timestamp();
+        let end_time = start_time + duration;
+        let memo = String::from_str(&h.env, "prop_cancel_solvency");
+
+        let stream_id = h.client.create_stream(
+            &creator,
+            &recipient,
+            &total_amount,
+            &h.token_id,
+            &start_time,
+            &end_time,
+            &memo,
+        );
+
+        let cancel_time = start_time + elapsed;
+        h.env.ledger().set_timestamp(cancel_time);
+
+        let split = h.client.get_stream_cancel_split(&stream_id);
+        prop_assert_eq!(split.0 + split.1 + split.2, total_amount);
+        prop_assert!(split.1 >= 0);
+        prop_assert!(split.2 >= 0);
+
+        let unvested = h.client.cancel_stream(&creator, &stream_id);
+        prop_assert_eq!(unvested, split.2);
+
+        let stream = h.client.get_stream(&stream_id);
+        prop_assert!(stream.cancelled);
+        prop_assert_eq!(stream.claimed_amount + unvested, total_amount);
+        prop_assert_eq!(h.client.get_locked_balance(), 0);
     }
 }
 

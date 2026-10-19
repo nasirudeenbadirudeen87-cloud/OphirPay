@@ -345,6 +345,14 @@ export enum PaymentErrorCode {
   RefundWindowExpired = 50,
   AlreadyVoted = 51,
   ReentrantCall = 52,
+  PaymentIdempotencyConflict = 309,
+  StreamDurationTooShort = 310,
+  StreamDurationTooLong = 311,
+  InvalidDecimalPrecision = 312,
+  MemoTooLong = 313,
+  InvalidThreshold = 314,
+  EmptySignersList = 315,
+  DisputeCoolingOffActive = 316,
 }
 
 export const PAYMENT_ERROR_MESSAGES: Record<number, string> = {
@@ -400,4 +408,12 @@ export const PAYMENT_ERROR_MESSAGES: Record<number, string> = {
   50: "Refund window has expired — no longer eligible",
   51: "Voter has already voted on this proposal",
   52: "Reentrant call detected — execution rejected by reentrancy lock",
+  309: "Idempotency key was reused for a different payment payload",
+  310: "Stream duration is too short: minimum duration is 60 seconds",
+  311: "Stream duration is too long: maximum duration is 5 years",
+  312: "Payment amount violates token decimal precision constraints",
+  313: "Payment memo exceeds maximum length or contains invalid control characters",
+  314: "Threshold cannot be zero or exceed signer count",
+  315: "Signers list cannot be empty",
+  316: "Dispute cooling-off period is still active",
 };

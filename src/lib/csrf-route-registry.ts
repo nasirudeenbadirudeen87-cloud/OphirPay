@@ -29,7 +29,7 @@ export interface CsrfRouteEntry {
 }
 
 /**
- * Every browser-reachable mutating route (37 handlers).
+ * Every browser-reachable mutating route.
  *
  * Machine-invoked endpoints live in CSRF_EXEMPT_ROUTES below.
  */
@@ -42,6 +42,7 @@ export const MUTATING_ROUTES: CsrfRouteEntry[] = [
   { method: "POST", path: "/api/keys", routeFile: "keys/route.ts", description: "Generate API key" },
   { method: "PATCH", path: "/api/keys", routeFile: "keys/route.ts", description: "Update key scopes" },
   { method: "DELETE", path: "/api/keys", routeFile: "keys/route.ts", description: "Revoke API key" },
+  { method: "POST", path: "/api/keys/[id]/rotate", routeFile: "keys/[id]/rotate/route.ts", description: "Rotate API key with a 24-hour overlap" },
 
   // Payments
   { method: "POST", path: "/api/payments", routeFile: "payments/route.ts", description: "Create payment" },
@@ -59,6 +60,8 @@ export const MUTATING_ROUTES: CsrfRouteEntry[] = [
   { method: "PATCH", path: "/api/recurring", routeFile: "recurring/route.ts", description: "Update recurrence settings" },
   { method: "PATCH", path: "/api/recurring/[id]", routeFile: "recurring/[id]/route.ts", description: "Update recurring schedule" },
   { method: "POST", path: "/api/requests", routeFile: "requests/route.ts", description: "Create payment request" },
+  { method: "POST", path: "/api/requests/[id]/paid", routeFile: "requests/[id]/paid/route.ts", description: "Confirm a request payment from its Stellar transaction" },
+  { method: "POST", path: "/api/requests/[id]/remind", routeFile: "requests/[id]/remind/route.ts", description: "Email a payment reminder to the payer" },
 
   // Scheduled payments
   { method: "POST", path: "/api/scheduled", routeFile: "scheduled/route.ts", description: "Create scheduled payment" },
@@ -75,8 +78,14 @@ export const MUTATING_ROUTES: CsrfRouteEntry[] = [
   { method: "POST", path: "/api/webhooks/[id]/replay", routeFile: "webhooks/[id]/replay/route.ts", description: "Replay stored webhook events" },
   { method: "POST", path: "/api/webhooks/[id]/test", routeFile: "webhooks/[id]/test/route.ts", description: "Send test webhook" },
   { method: "POST", path: "/api/webhooks/[id]/deliveries/[deliveryId]/redeliver", routeFile: "webhooks/[id]/deliveries/[deliveryId]/redeliver/route.ts", description: "Redeliver a webhook payload" },
+  { method: "POST", path: "/api/webhooks/[id]/deliveries/requeue", routeFile: "webhooks/[id]/deliveries/requeue/route.ts", description: "Requeue dead-lettered webhook deliveries" },
   { method: "POST", path: "/api/hooks", routeFile: "hooks/route.ts", description: "Register notification hook" },
   { method: "PATCH", path: "/api/hooks/[id]", routeFile: "hooks/[id]/route.ts", description: "Deactivate notification hook" },
+
+  // Admin step-up (issue #1389) — these routes authorize an on-chain admin
+  // mutation after a cryptographic re-verification newer than 15 minutes.
+  { method: "POST", path: "/api/fee-config", routeFile: "fee-config/route.ts", description: "Authorize a protocol fee-config change (sudo step-up)" },
+  { method: "POST", path: "/api/rbac", routeFile: "rbac/route.ts", description: "Authorize a role grant/revoke (sudo step-up)" },
 
   // Governance
   { method: "POST", path: "/api/governance/proposals", routeFile: "governance/proposals/route.ts", description: "Create governance proposal" },
@@ -139,5 +148,16 @@ export const CSRF_EXEMPT_ROUTES: CsrfExemptRoute[] = [
     path: "/api/scheduled/run",
     routeFile: "scheduled/run/route.ts",
     reason: "Scheduled-payment runner; authenticated by CRON_SECRET, not a browser session.",
+  },
+  {
+    method: "POST",
+    path: "/api/csp-report",
+    routeFile: "csp-report/route.ts",
+    reason:
+      "Browser-generated CSP violation report. Sent by the browser itself (no user session), " +
+      "not by JavaScript on the page. CSRF tokens cannot be included in browser-generated " +
+      "reports; the browser is the authorised sender by definition. The endpoint only accepts " +
+      "structured CSP payloads, is size-capped at 16 KiB, never mutates state, and only logs " +
+      "and increments a counter.",
   },
 ];

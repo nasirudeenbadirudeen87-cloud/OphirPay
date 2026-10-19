@@ -39,9 +39,12 @@ podAnnotations:
 
 podSecurityContext:
   fsGroup: 1001
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
   runAsNonRoot: true
   runAsUser: 1001
   capabilities:
@@ -91,6 +94,24 @@ pdb:
 
 networkPolicy:
   enabled: true
+  # Prometheus scraping ingress configuration (issue #1344).
+  # Allows Prometheus scrapers from the monitoring namespace to reach the metrics endpoint.
+  metrics:
+    enabled: true
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring
+    podSelector: {}
+  # Egress configuration for Redis and custom backing services (issue #1345).
+  redis:
+    enabled: true
+    port: 6379
+    # Target namespace / pod selectors for Redis (optional; empty allows any in-cluster Redis on port 6379).
+    namespaceSelector: {}
+    podSelector: {}
+  egress:
+    # Additional TCP ports to allow for custom egress destinations.
+    extraPorts: []
 
 # ── Runtime configuration (rendered into a ConfigMap) ──────────
 # Every key here must be a real variable documented in `.env.example`;
@@ -116,6 +137,10 @@ config:
   RATE_LIMIT_RPM: "120"
   AUTH_RATE_LIMIT_IP_RPM: "30"
   AUTH_RATE_LIMIT_WALLET_RPM: "10"
+  # Empty by default so error reporting stays opt-in. `NEXT_PUBLIC_*` values
+  # are inlined at build time (see the note above), so pointing an existing
+  # image at a DSN requires rebuilding with it set — not just `helm upgrade`.
+  NEXT_PUBLIC_SENTRY_DSN: ""
 
 # ── Secrets (rendered into a Kubernetes Secret) ────────────────
 # Names must also exist in `.env.example` (same test as `config` above).
@@ -125,9 +150,19 @@ secrets:
   NEXT_PUBLIC_EMITTER_CONTRACT_ID: ""
   AUTH_SECRET: ""
 
+# ── Probes (issue #738) ────────────────────────────────────────
+# Liveness and readiness answer different questions, so they hit different
+# endpoints:
+#   • liveness  → /api/health/live  — process-only, no DB/RPC/Redis I/O, so a
+#                                    transient dependency outage never restarts
+#                                    an otherwise healthy pod.
+#   • readiness → /api/health       — dependency-aware; 503 while the database
+#                                    is unreachable, which drains traffic from
+#                                    the pod without killing it.
+# Both paths are exempt from the global rate limiter (src/proxy.ts).
 livenessProbe:
   httpGet:
-    path: /api/health
+    path: /api/health/live
     port: 3000
   initialDelaySeconds: 30
   periodSeconds: 15

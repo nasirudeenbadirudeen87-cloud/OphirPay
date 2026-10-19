@@ -36,6 +36,11 @@ const HEARTBEAT_GRACE_MS = 10_000; // tolerated scheduling jitter
 const CONNECT_TIMEOUT_MS = 10_000;
 const SAMPLE_INTERVAL_MS = 2_000;
 const SETTLE_MS = 3_000; // wait after disconnect before leak checks
+// Stalled-consumer phase (issue #744): clients that connect but never read
+// their body. Their per-connection buffers must stay bounded and, once they
+// disconnect, the open-connection gauge must return to baseline.
+const STALLED_CLIENTS = Number(process.env.STALLED_CLIENTS || 25);
+const STALLED_DURATION_MS = Number(process.env.STALLED_DURATION_MS || 5_000);
 
 // Memory bounds (bytes). Generous so slow CI runners never flake, but tight
 // enough to catch genuine unbounded growth / connection leaks.
@@ -171,6 +176,7 @@ async function runLoadTest() {
   console.log("└────────────────────────────────────────────────────────────┘");
   info(`Endpoint:  ${ENDPOINT}`);
   info(`Clients:   ${CONCURRENCY}`);
+  info(`Stalled:   ${STALLED_CLIENTS} (read nothing for ${(STALLED_DURATION_MS / 1000).toFixed(0)}s)`);
   info(`Duration:  ${(DURATION_MS / 1000).toFixed(0)}s (heartbeat every ${HEARTBEAT_INTERVAL_MS / 1000}s)`);
   info(`Metrics:   ${METRICS_URL}`);
 
@@ -343,6 +349,50 @@ async function runLoadTest() {
   info(`Harness heap growth: +${mb(harnessPeakDelta)}`);
   if (harnessPeakDelta > MAX_HARNESS_HEAP_DELTA) {
     failures.push(`load-test harness heap grew ${mb(harnessPeakDelta)} (> ${mb(MAX_HARNESS_HEAP_DELTA)})`);
+  }
+
+  // 7g. Stalled consumers: memory stays bounded and the gauge returns to
+  //     baseline once they disconnect (issue #744).
+  const stalledAbort = new AbortController();
+  const stalledResponses = [];
+  for (let i = 0; i < STALLED_CLIENTS; i++) {
+    try {
+      const res = await fetch(ENDPOINT, {
+        headers: { Accept: "text/event-stream", "Cache-Control": "no-cache" },
+        signal: stalledAbort.signal,
+      });
+      // Deliberately never read the body — this is the stalled consumer.
+      stalledResponses.push(res);
+    } catch (err) {
+      if (!(err && err.name === "AbortError")) {
+        failures.push(`stalled client ${i} failed to connect: ${err.message}`);
+      }
+    }
+  }
+  await sleep(STALLED_DURATION_MS);
+  const duringStalled = await fetchServerMetrics();
+  info(`Stalled phase: ${stalledResponses.length} stalled client(s) connected, server reports ${duringStalled.sseOpen ?? "unknown"} open SSE connection(s)`);
+  if (duringStalled.heapUsed !== null && baseline.heapUsed !== null) {
+    const stalledHeapDelta = duringStalled.heapUsed - baseline.heapUsed;
+    info(`Stalled-phase server heap delta: +${mb(stalledHeapDelta)}`);
+    if (stalledHeapDelta > MAX_SERVER_HEAP_DELTA) {
+      failures.push(`server heap grew ${mb(stalledHeapDelta)} with stalled clients (> ${mb(MAX_SERVER_HEAP_DELTA)})`);
+    }
+  }
+  stalledAbort.abort();
+  // Release the harness-side streams as well.
+  await Promise.allSettled(
+    stalledResponses.map((res) =>
+      res.body ? res.body.cancel().catch(() => {}) : Promise.resolve()
+    )
+  );
+  await sleep(SETTLE_MS);
+  const afterStalled = await fetchServerMetrics();
+  info(`Open SSE connections after stalled clients disconnected: ${afterStalled.sseOpen ?? "unknown"}`);
+  if (afterStalled.sseOpen !== null && afterStalled.sseOpen !== 0) {
+    failures.push(`server still reports ${afterStalled.sseOpen} open SSE connection(s) after stalled clients disconnected`);
+  } else {
+    pass("Gauge returned to baseline after stalled clients disconnected");
   }
 
   // 8. Summary

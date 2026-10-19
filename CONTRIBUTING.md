@@ -4,7 +4,12 @@ Thank you for your interest in contributing! OphirPay is an open-source payment 
 
 ## Getting Started
 
-1. Ensure you have Node.js 20 installed (see `.nvmrc`)
+> **Fastest path:** Open this repository in a **Devcontainer** (GitHub Codespaces or VS Code). It automatically provisions Node 24, the pinned Rust toolchain + WASM targets, Postgres, and Redis. Just copy `.env.example` to `.env.local` and run `npm run dev`.
+
+1. Ensure you have **Node.js 24** installed (see `.nvmrc`) — `npm install`
+   runs a preflight (`scripts/check-node.mjs`) and aborts with an actionable
+   message on any other major, so there is no ambiguity about the supported
+   runtime
 2. Fork the repository
 3. Clone your fork: `git clone https://github.com/YOUR_USERNAME/OphirPay.git`
 4. Install dependencies: `npm install`
@@ -22,11 +27,80 @@ Thank you for your interest in contributing! OphirPay is an open-source payment 
 > WASM, Freighter, memo, trustline, path payments, sponsored reserves, and
 > more).
 
+### Supported toolchain
+
+| Tool | Supported | Declared in |
+|---|---|---|
+| Node.js | **24.x** | `.nvmrc` (`24`), `package.json` → `engines.node` (`24.x`), and `node-version-file: .nvmrc` in every workflow |
+| npm | **10.x** | `package.json` → `packageManager` (`npm@10.8.2`) |
+
+`.nvmrc` is the single source of truth. `npm install` / `npm ci` run the
+`preinstall` hook first, so an unsupported Node major stops immediately with:
+
+```
+[ERROR] Unsupported Node.js version.
+  required : Node 24.x (.nvmrc → "24", package.json engines.node → "24.x", packageManager → "npm@10.8.2")
+  running  : Node 24.14.0
+
+Switch to the supported version and re-run the install:
+  nvm install && nvm use        # reads .nvmrc
+```
+
+A running npm major that differs from `packageManager` is reported as a
+warning rather than an error (a newer npm on Node 24 still installs the same
+lockfile), but please install with the pinned manager to avoid lockfile churn.
+
+**Bumping the version** — change `.nvmrc` and `engines.node` together, then run
+`npm test -- node-preflight`. `src/__tests__/node-preflight.test.ts` fails if
+`.nvmrc`, `engines.node`, `packageManager` or any workflow's
+`node-version-file` disagree, so a half-finished bump cannot merge.
+
 ## Development Workflow
 
 - **Branch naming**: `feat/feature-name`, `fix/bug-description`, `docs/what-changed`, `ci/what-changed`, `test/what-changed`
 - **Commits**: Follow [Conventional Commits](https://www.conventionalcommits.org)
 - **Before submitting**: Run `npm run ci` (typecheck → lint → test → build)
+
+### Local secret scanning (pre-commit hook)
+
+`npm install` (via the `prepare` script) points git at the committed
+`.githooks/` directory, so a pre-commit hook scans **staged** changes with
+[gitleaks](https://github.com/gitleaks/gitleaks) before they can reach a branch:
+
+```bash
+npm run prepare          # (re)enable the hook — also runs on `npm install`
+npm run secrets:precommit  # run the scan by hand against the staged changes
+npm run secrets:scan       # scan the whole repo with .gitleaks.toml
+```
+
+What it does:
+
+- Uses the same `.gitleaks.toml` as CI, which extends gitleaks' ~160 default
+  rules **and** adds a strict Stellar secret-seed rule (`S` + 55 base32 chars).
+- Blocks the commit (exit 1) when a seed, API key or private key is staged.
+- Skips with a warning when gitleaks is not installed — run one of
+  ```bash
+  brew install gitleaks                                   # macOS
+  # or grab a release binary: https://github.com/gitleaks/gitleaks/releases
+  ```
+  to enable it. CI still scans every PR regardless, so a bypassed hook never
+  reaches `main` unnoticed.
+
+If gitleaks flags a **documented, non-sensitive** demo value, add it (with a
+short reason) to the `[allowlist]` in `.gitleaks.toml` rather than committing
+with `--no-verify`. Never commit a real key or seed: remove it, rotate the
+credential, and re-stage.
+
+> The hook is committed at `.githooks/pre-commit` and wired via
+> `core.hooksPath` (set by `scripts/install-git-hooks.mjs`) — no husky
+> dependency, and the hook itself is reviewable in the repo.
+
+### Type safety and lint suppressions
+
+Use `unknown` with a type guard or a narrower domain type instead of `any`.
+Type-safety ESLint suppressions should be avoided; when a targeted suppression
+is necessary, keep it to one line and explain why on that line. The zero-warning
+ESLint check runs in CI.
 
 ### Dependency Updates
 
@@ -42,11 +116,38 @@ ecosystems once a week.
   breaking changes or fails CI, coordinate with the team before merging instead
   of force-landing it.
 
+### Issue triage & stale policy
+
+The [stale workflow](.github/workflows/stale.yml) runs every Monday and closes
+issues that have been inactive for **60 days + a 14-day grace period**. Bounty
+work is exempt, so the wave backlog does not get closed out from under a
+contributor:
+
+| Signal on the issue | Result |
+|---|---|
+| Label `bounty` or `Stellar Wave` | **Never** marked stale — a wave round may outlive the inactivity window |
+| Any assignee (claimed work) | **Never** marked stale — the claim is the activity signal |
+| Label `pinned`, `security`, `blocked`, `good first issue`, `help wanted` | **Never** marked stale |
+| Any milestone | Exempt (`exempt-all-issue-milestones`) |
+| Anything else, unassigned | Marked `stale` after 60 days, closed 14 days later — commenting or pushing clears it |
+
+Pull requests follow a shorter clock (30 days stale, 7 days to close); `pinned`,
+`blocked` and `security` PRs plus drafts are exempt.
+
+When adding a new long-running programme (a wave, a funded milestone, a
+migration epic), add its label to `exempt-issue-labels` in
+`.github/workflows/stale.yml` **and** to the table above so maintainers can see
+the policy in one place.
+
 ### Adding or changing an API endpoint
 
 Before adding or modifying an API endpoint, read the [API Endpoint Guide](docs/API_GUIDE.md). It documents the mandatory conventions: file structure, Zod validation, the error-handling pattern, auth middleware usage, the response envelope, rate-limit integration, a copy-pasteable worked example, and a pre-merge checklist.
 
 ## CI/CD Pipeline
+
+See [`docs/MERGE_GATE.md`](docs/MERGE_GATE.md) for the authoritative table of
+required pull-request checks, local commands, and scheduled workflows that do
+not block merges.
 
 Every PR triggers the following independent CI/CD checks across quality,
 testing, security, and DevOps. The jobs in `.github/workflows/ci.yml` are the
@@ -94,6 +195,19 @@ Configure these in **Settings → Branches → Branch protection rules** for `ma
 > **1 approving review** before it can be merged.
 
 ## Testing
+
+### Soroban contract tests
+
+Both contract crates use the same layout:
+
+- Put unit tests that need private implementation details in
+  `contracts/<crate>/src/test.rs`.
+- Put tests that exercise only the public contract API, including integration
+  and property tests, in `contracts/<crate>/tests/`.
+- Run a crate's complete Rust suite with `cd contracts/<crate> && cargo test`.
+
+This keeps implementation-level tests in the unit-test harness and gives
+public-contract tests the same integration-test harness in both crates.
 
 ```bash
 npm test              # Run all tests (800 frontend)

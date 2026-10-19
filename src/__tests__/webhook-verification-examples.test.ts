@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { buildSignedPayload } from "@/lib/webhook-deliver";
 
@@ -10,6 +11,7 @@ const SECRET = "test-secret-0123456789";
 const EXAMPLES_DIR = path.resolve(process.cwd(), "examples/webhook-verification");
 const NODE_VERIFY = path.join(EXAMPLES_DIR, "node/verify.mjs");
 const PY_VERIFY = path.join(EXAMPLES_DIR, "python/verify.py");
+const GO_DIR = path.join(EXAMPLES_DIR, "go");
 const SAMPLE_PAYLOAD = path.join(EXAMPLES_DIR, "sample-payload.json");
 
 const samplePayload = {
@@ -39,9 +41,25 @@ function runPython(args: string[], input?: string): RunResult {
   return { status: res.status, stdout: String(res.stdout ?? ""), stderr: String(res.stderr ?? "") };
 }
 
+/**
+ * Run the Go verifier through `go run` so no prebuilt binary is required.
+ * GOFLAGS=-mod=mod keeps the stdlib-only module buildable in sandboxes with
+ * an empty module cache.
+ */
+function runGo(args: string[], input?: string): RunResult {
+  const res = spawnSync("go", ["run", ".", ...args], {
+    input,
+    encoding: "utf8",
+    cwd: GO_DIR,
+    env: { ...process.env, GOFLAGS: "-mod=mod" },
+  });
+  return { status: res.status, stdout: String(res.stdout ?? ""), stderr: String(res.stderr ?? "") };
+}
+
 // Probe at module scope: `it.skipIf` evaluates its condition during test
 // collection, before `beforeAll` hooks run.
 const hasPython = spawnSync("python3", ["--version"], { encoding: "utf8" }).status === 0;
+const hasGo = spawnSync("go", ["version"], { encoding: "utf8" }).status === 0;
 
 describe("webhook verification examples — Node (verify.mjs)", () => {
   it("verifies a payload produced by buildSignedPayload", () => {
@@ -259,5 +277,114 @@ describe("webhook verification examples — docs consistency", () => {
       maxAgeSeconds: 0,
     });
     expect(honest.valid).toBe(true);
+  });
+});
+
+describe("webhook verification examples — Go (verify.go)", () => {
+  // `go run .` compiles the verifier on its first invocation, which blows past
+  // the default 5s test timeout on a cold CI runner. Warm the build cache once
+  // with an explicit budget so the tests below measure verification, not
+  // compilation (the first Go test was failing CI at 5s while compiling).
+  beforeAll(() => {
+    if (!hasGo) return;
+    const warm = spawnSync(
+      "go",
+      ["build", "-o", path.join(os.tmpdir(), "ophirpay-go-verify-warm")],
+      {
+        cwd: GO_DIR,
+        encoding: "utf8",
+        timeout: 60_000,
+        env: { ...process.env, GOFLAGS: "-mod=mod" },
+      }
+    );
+    expect(warm.status).toBe(0);
+  }, 60_000);
+
+  it.skipIf(!hasGo)("verifies a payload produced by buildSignedPayload", () => {
+    const { body, signature } = buildSignedPayload(
+      { ...samplePayload, timestamp: new Date().toISOString() },
+      SECRET
+    );
+    const res = runGo(["--secret", SECRET, "--signature", signature], body);
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe("VALID");
+  });
+
+  it.skipIf(!hasGo)("rejects a tampered body", () => {
+    const { body, signature } = buildSignedPayload(samplePayload, SECRET);
+    const tampered = body.replace('"amount":100', '"amount":999');
+    const res = runGo(["--secret", SECRET, "--signature", signature, "--now", "2026-08-14T00:00:30Z"], tampered);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain("INVALID");
+  });
+
+  it.skipIf(!hasGo)("rejects a wrong secret", () => {
+    const { body, signature } = buildSignedPayload(samplePayload, SECRET);
+    const res = runGo(["--secret", "wrong-secret", "--signature", signature, "--now", "2026-08-14T00:00:30Z"], body);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain("INVALID");
+  });
+
+  it.skipIf(!hasGo)("rejects a replayed (too old) delivery", () => {
+    const { body, signature } = buildSignedPayload(samplePayload, SECRET);
+    const res = runGo(["--secret", SECRET, "--signature", signature, "--now", "2026-08-14T01:00:00Z"], body);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain("too old");
+  });
+
+  it.skipIf(!hasGo)("verifies the docs sample payload (sample-payload.json)", () => {
+    const res = runGo(
+      ["--secret", SECRET, "--signature", SAMPLE_SIGNATURE, "--now", "2026-08-14T00:00:30Z", "--body-file", SAMPLE_PAYLOAD],
+    );
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe("VALID");
+  });
+
+  it.skipIf(!hasGo)("verifies with the X-OphirPay-Timestamp header supplied explicitly", () => {
+    const { body, signature, timestamp } = buildSignedPayload(samplePayload, SECRET);
+    const res = runGo(
+      [
+        "--secret",
+        SECRET,
+        "--signature",
+        signature,
+        "--timestamp",
+        timestamp,
+        "--now",
+        "2026-08-14T00:00:30Z",
+      ],
+      body
+    );
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe("VALID");
+  });
+
+  it.skipIf(!hasGo)("rejects a stale header timestamp outside the window", () => {
+    const { body, signature } = buildSignedPayload(samplePayload, SECRET);
+    const res = runGo(
+      [
+        "--secret",
+        SECRET,
+        "--signature",
+        signature,
+        "--timestamp",
+        SAMPLE_TIMESTAMP,
+        "--now",
+        "2026-08-14T01:00:00Z",
+      ],
+      body
+    );
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain("too old");
+  });
+
+  it.skipIf(!hasGo)("rejects a key-reordered body with a signature mismatch", () => {
+    // The Go verifier preserves received key order (Node parity), so
+    // re-ordering members changes the canonical bytes and must fail.
+    const { body, signature } = buildSignedPayload(samplePayload, SECRET);
+    const reordered = JSON.stringify(JSON.parse(body), Object.keys(JSON.parse(body)).reverse());
+    const res = runGo(["--secret", SECRET, "--signature", signature, "--now", "2026-08-14T00:00:30Z"], reordered);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toContain("signature mismatch");
   });
 });

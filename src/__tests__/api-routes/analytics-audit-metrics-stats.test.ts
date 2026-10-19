@@ -11,6 +11,14 @@ vi.mock("@/lib/prisma", () => ({
       groupBy: vi.fn(),
     },
   },
+  getPrismaPrometheusMetrics: vi.fn().mockResolvedValue(""),
+  getPrismaPoolMetrics: vi.fn().mockResolvedValue({
+    busy: 0,
+    idle: 0,
+    open: 0,
+    waitDurationMsSum: 0,
+    waitDurationMsCount: 0,
+  }),
 }));
 
 vi.mock("@/lib/api-auth", async () => {

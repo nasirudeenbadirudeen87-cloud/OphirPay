@@ -3,6 +3,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { logger } from "@/lib/logger";
 import { getRequestId, REQUEST_ID_HEADER } from "@/lib/request-id";
+import { getCurrentSpan, REQUEST_ID_SPAN_ATTRIBUTE } from "@/lib/tracing";
 
 /**
  * Async context carrying the current request's id. The proxy (`src/proxy.ts`)
@@ -49,6 +50,11 @@ export function withRequestLogging<T extends RouteHandler>(handler: T): T & Hand
     const requestId = req.headers?.get(REQUEST_ID_HEADER) ?? (await getRequestId());
 
     try {
+      // Stamp the active span (when tracing is enabled) with the request id so
+      // logs and traces correlate (issue #815). The attribute key is part of
+      // the documented allowlist, so it survives the PII filter.
+      getCurrentSpan()?.setAttribute(REQUEST_ID_SPAN_ATTRIBUTE, requestId);
+
       // Concrete handler types are narrower than the internal call signature
       // (e.g. `(request, { params }) => ...`), so invoke through the callable.
       const callable = handler as unknown as HandlerCallable;

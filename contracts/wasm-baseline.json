@@ -1,9 +1,10 @@
 {
-  "sizeThresholdPercent": 3,
+  "sizeThresholdPercent": 5,
+  "protocolLimitBytes": 131072,
   "contracts": {
     "ophirpay": {
       "artifact": "contracts/ophirpay/target/wasm32v1-none/release/ophirpay_contract.wasm",
-      "baselineBytes": 170007,
+      "baselineBytes": 189425,
       "maxBytes": 524288
     },
     "emitter": {

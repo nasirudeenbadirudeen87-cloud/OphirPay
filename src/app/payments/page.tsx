@@ -5,7 +5,9 @@ import {
   Suspense,
   startTransition,
   useCallback,
+  useEffect,
   useMemo,
+  useRef,
   useState,
   useOptimistic,
   type ReactNode,
@@ -20,6 +22,7 @@ import { useToast } from "@/components/ui/Toast";
 import { getStellarExplorerUrl, XLM_STROOPS } from "@/lib/stellar";
 import { exportToCsv } from "@/lib/csv";
 import { Breadcrumb } from "@/components/Breadcrumb";
+import { PaymentFilters } from "@/components/payments/PaymentFilters";
 import { EmptyState } from "@/components/EmptyState";
 import { LoadingSkeleton } from "@/components/LoadingSkeleton";
 import { Skeleton } from "@/components/ui/Skeleton";
@@ -40,6 +43,7 @@ import {
   type PaymentSortKey,
 } from "@/lib/payments-sort";
 import { useTableKeyboardNavigation } from "@/hooks/useTableKeyboardNavigation";
+import { useVirtualRows } from "@/hooks/useVirtualRows";
 
 // ── Sortable column header ─────────────────────────────────────
 
@@ -108,8 +112,11 @@ interface OnChainData {
   total: number;
 }
 
-const ALLOWED_PAGE_SIZES = [10, 25, 50] as const;
+const ALLOWED_PAGE_SIZES = [10, 25, 50, 100, 250] as const;
 const DEFAULT_PAGE_SIZE = 25;
+
+/** Max height of the virtualized scroll viewport (issue #745). */
+const VIRTUAL_TABLE_MAX_HEIGHT = 600;
 
 // Fetch the complete on-chain dataset rather than a recent slice. Sorting and
 // pagination run client-side, so operating on a partial slice would silently
@@ -144,7 +151,7 @@ function PaymentsClient() {
   const pathname = usePathname();
 
   // Pre-populate the search box from `?q=` so filtered views are shareable
-  // (Issue #157: the search param lives in the URL).
+  // and keep it in sync when browser history restores an earlier view.
   const [search, setSearch] = useState(() => searchParams.get("q") ?? "");
   const debouncedSearch = useDebounce(search, 300);
 
@@ -218,6 +225,43 @@ function PaymentsClient() {
   const dateTo = searchParams.get("dateTo") ?? "";
   const assetFilter = searchParams.get("asset") ?? "";
 
+  const updateQuery = useCallback(
+    (updates: Record<string, string | null>) => {
+      const params = new URLSearchParams(searchParams.toString());
+      for (const [key, value] of Object.entries(updates)) {
+        if (value === null) params.delete(key);
+        else params.set(key, value);
+      }
+      const query = params.toString();
+      router.push(query ? `${pathname}?${query}` : pathname, { scroll: false });
+    },
+    [pathname, router, searchParams]
+  );
+
+  // Sync the box when the URL query changes (back/forward, shared links).
+  // Depend on the *string*, not the URLSearchParams object: the object is a
+  // fresh instance on every render, and an unstable dep makes this effect
+  // refire on every commit — which, inside a transition, is an update loop.
+  const urlQuery = searchParams.get("q") ?? "";
+  useEffect(() => {
+    setSearch(urlQuery);
+  }, [urlQuery]);
+
+  const previousDebouncedSearch = useRef(debouncedSearch);
+  useEffect(() => {
+    if (debouncedSearch === previousDebouncedSearch.current) return;
+    previousDebouncedSearch.current = debouncedSearch;
+    const query = debouncedSearch.trim();
+    if (query !== (searchParams.get("q") ?? "")) {
+      updateQuery({ q: query || null, page: null });
+    }
+  }, [debouncedSearch, searchParams, updateQuery]);
+
+  const assetOptions = useMemo(
+    () => [...new Set(payments.map((payment) => payment.assetCode ?? "XLM"))].sort(),
+    [payments]
+  );
+
   // Client-side search/filter
   const filtered = useMemo(() => {
     const q = debouncedSearch.toLowerCase();
@@ -258,20 +302,26 @@ function PaymentsClient() {
   const startIndex = (currentPage - 1) * pageSize;
   const paginated = sorted.slice(startIndex, startIndex + pageSize);
 
+  // Row virtualization (issue #745): only the rows in the viewport (plus
+  // overscan) are mounted, so a large page keeps the DOM bounded while the
+  // scrollbar still reflects every row. Small pages render in full.
+  const {
+    startIndex: windowStart,
+    endIndex: windowEnd,
+    topSpacerHeight,
+    bottomSpacerHeight,
+    virtualized,
+    containerRef,
+    onScroll,
+  } = useVirtualRows(paginated.length);
+  const visibleRows = virtualized
+    ? paginated.slice(windowStart, windowEnd)
+    : paginated;
+
   // Roving-tabindex keyboard navigation: the active row is in the tab order
   // and ArrowUp/Down/Home/End move between rows (also from row actions).
   const { activeIndex, getRowProps, onRowsKeyDown, tbodyRef } =
-    useTableKeyboardNavigation(paginated.length);
-
-  const updateQuery = (updates: Record<string, string | null>) => {
-    const params = new URLSearchParams(searchParams.toString());
-    for (const [key, value] of Object.entries(updates)) {
-      if (value === null) params.delete(key);
-      else params.set(key, value);
-    }
-    const query = params.toString();
-    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
-  };
+    useTableKeyboardNavigation(visibleRows.length);
 
   const goToPage = (target: number) => updateQuery({ page: target <= 1 ? null : String(target) });
 
@@ -281,19 +331,36 @@ function PaymentsClient() {
       page: null,
     });
 
+  // Explicit "load more" affordance: grow the page size to the next rung so
+  // more rows are loaded while virtualization keeps the mounted DOM bounded.
+  const nextPageSize = ALLOWED_PAGE_SIZES.find((size) => size > pageSize);
+  const canLoadMore = nextPageSize !== undefined && filtered.length > pageSize;
+  const loadMore = () => {
+    if (nextPageSize === undefined) return;
+    updateQuery({
+      pageSize: nextPageSize === DEFAULT_PAGE_SIZE ? null : String(nextPageSize),
+    });
+  };
+
   const { currency, setCurrency } = useCurrencyDisplay();
-  const { price: xlmPrice, isUnavailable: isPriceUnavailable } = useXlmPrice();
+  const {
+    price: xlmPrice,
+    isLoading: isPriceLoading,
+    isUnavailable: isPriceUnavailable,
+    isStale: isPriceStale,
+  } = useXlmPrice();
 
   const renderPaymentAmount = (payment: OnChainPayment) => {
     const xlmAmount = payment.amountStroops / XLM_STROOPS;
     if (currency !== "USD") {
       return formatAmount(xlmAmount, "XLM");
     }
-    if (xlmPrice !== null) {
+    const usdAmount = xlmPrice !== null ? convertXlmToUsd(xlmAmount, xlmPrice) : null;
+    if (usdAmount !== null) {
       return (
         <div>
           <span className="font-medium text-gray-900 dark:text-white">
-            {formatFiatAmount(convertXlmToUsd(xlmAmount, xlmPrice), { showApprox: true })}
+            {formatFiatAmount(usdAmount, { showApprox: true })}
           </span>
           <span className="block text-[11px] text-gray-400 dark:text-gray-500">
             {formatAmount(xlmAmount, "XLM")}
@@ -305,7 +372,11 @@ function PaymentsClient() {
       <div>
         <span>{formatAmount(xlmAmount, "XLM")}</span>
         <span className="block text-[11px] text-amber-600 dark:text-amber-400 font-sans">
-          (USD unavailable)
+          {isPriceUnavailable
+            ? "(USD unavailable)"
+            : isPriceLoading
+              ? "(USD price loading)"
+              : "(USD amount unavailable)"}
         </span>
       </div>
     );
@@ -371,6 +442,7 @@ function PaymentsClient() {
             showPrice={currency === "USD"}
             price={xlmPrice}
             isUnavailable={isPriceUnavailable}
+            isStale={isPriceStale}
           />
           <button
             type="button"
@@ -435,30 +507,37 @@ function PaymentsClient() {
         </div>
       </div>
 
-      {/* Search bar */}
-      <div className="relative max-w-sm">
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          fill="none"
-          viewBox="0 0 24 24"
-          strokeWidth={1.5}
-          stroke="currentColor"
-          className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
-        >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"
-          />
-        </svg>
-        <input
-          type="text"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search by address, hash, or ID..."
-          className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400 text-sm focus:outline-none focus:ring-2 focus:ring-ophir-500 focus:border-transparent"
-        />
-      </div>
+      <PaymentFilters
+        search={search}
+        onSearchChange={setSearch}
+        status={statusFilter}
+        onStatusChange={(value) =>
+          updateQuery({ status: value || null, page: null })
+        }
+        dateFrom={dateFrom}
+        onDateFromChange={(value) =>
+          updateQuery({ dateFrom: value || null, page: null })
+        }
+        dateTo={dateTo}
+        onDateToChange={(value) =>
+          updateQuery({ dateTo: value || null, page: null })
+        }
+        asset={assetFilter}
+        onAssetChange={(value) =>
+          updateQuery({ asset: value || null, page: null })
+        }
+        assetOptions={assetOptions}
+        onClear={() =>
+          updateQuery({
+            q: null,
+            status: null,
+            dateFrom: null,
+            dateTo: null,
+            asset: null,
+            page: null,
+          })
+        }
+      />
 
       {/* Chain record count */}
       <div className="flex items-center gap-2">
@@ -490,7 +569,14 @@ function PaymentsClient() {
       )}
 
       {/* Empty state / Table */}
-      {!loading && !error && payments.length === 0 && !search ? (
+      {!loading &&
+      !error &&
+      payments.length === 0 &&
+      !search &&
+      !statusFilter &&
+      !dateFrom &&
+      !dateTo &&
+      !assetFilter ? (
         <EmptyState
           icon={
             <svg
@@ -515,8 +601,20 @@ function PaymentsClient() {
         />
       ) : (
       <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm" aria-busy={loading}>
+        <div
+          ref={containerRef}
+          onScroll={onScroll}
+          className="overflow-x-auto overflow-y-auto"
+          style={virtualized ? { maxHeight: VIRTUAL_TABLE_MAX_HEIGHT } : undefined}
+        >
+          {virtualized && topSpacerHeight > 0 && (
+            <div style={{ height: topSpacerHeight }} aria-hidden="true" />
+          )}
+          <table
+            className="w-full text-sm"
+            aria-busy={loading}
+            aria-rowcount={filtered.length + 1}
+          >
             <thead>
               <tr className="text-left text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-900/50">
                 <th scope="col" className="py-3 px-4 font-medium">Payment</th>
@@ -557,8 +655,8 @@ function PaymentsClient() {
                 <tr>
                   <td colSpan={5} className="py-12 text-center">
                     <p className="text-sm text-gray-500 dark:text-gray-400">
-                      {search
-                        ? "No payments match your search."
+                      {search || statusFilter || dateFrom || dateTo || assetFilter
+                        ? "No payments match your filters."
                         : "No on-chain payments yet — send one from the Send page."}
                     </p>
                   </td>
@@ -566,11 +664,12 @@ function PaymentsClient() {
               )}
 
               {!loading &&
-                paginated.map((payment, index) => (
+                visibleRows.map((payment, index) => (
                   <tr
                     key={payment.id}
                     data-row-index={index}
                     {...getRowProps(index)}
+                    aria-rowindex={startIndex + windowStart + index + 2}
                     className={cn(
                       "border-b border-gray-100 dark:border-gray-800/50 transition-colors",
                       index === activeIndex
@@ -646,6 +745,9 @@ function PaymentsClient() {
                 ))}
             </tbody>
           </table>
+          {virtualized && bottomSpacerHeight > 0 && (
+            <div style={{ height: bottomSpacerHeight }} aria-hidden="true" />
+          )}
         </div>
 
         {!loading && !error && filtered.length > 0 && (
@@ -670,6 +772,15 @@ function PaymentsClient() {
                   </option>
                 ))}
               </select>
+              {canLoadMore && (
+                <button
+                  type="button"
+                  onClick={loadMore}
+                  className="rounded-lg border border-gray-200 dark:border-gray-700 px-3 py-1 text-sm font-medium text-ophir-600 dark:text-ophir-400 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+                >
+                  Load more
+                </button>
+              )}
             </div>
             <Pagination
               page={currentPage}

@@ -1,79 +1,146 @@
 version: 2
 
-# Issue #732 — keep dependency updates flowing without drowning reviewers.
+# Dependabot configuration for OphirPay
 #
-# Every ecosystem the repo actually pins is covered: the root npm lockfile,
-# both Cargo.lock files (contracts/ophirpay, contracts/emitter) and the pinned
-# GitHub Actions. Each is checked once a week and minor/patch bumps are grouped
-# into a single PR per ecosystem; a major bump still arrives on its own so it
-# gets the attention it needs. `open-pull-requests-limit` caps the backlog a
-# busy week can create.
+# Configured with dependency grouping rules to minimize CI overhead and PR noise
+# while keeping security updates isolated and prioritized (issue #1415).
 #
-# See CONTRIBUTING.md → "Dependency Updates" for the review flow.
+# Ecosystems covered:
+# 1. npm (root):
+#    - react-ecosystem: next, react, react-dom, and related packages
+#    - dev-tools: eslint, prettier, vitest, playwright, typescript
+#    - utilities: zod, date-fns, qrcode, jspdf, js-yaml
+# 2. cargo (contracts/ophirpay & contracts/emitter):
+#    - soroban-sdk: Soroban smart contract SDK dependencies
+#    - rust-tooling: Supporting Rust crates and build tooling
+# 3. github-actions:
+#    - grouped monthly updates across all GitHub Actions workflows
+#
+# Security updates:
+# Security advisories bypass grouping rules and are opened as individual,
+# high-priority pull requests for rapid triage and patching.
 
 updates:
+  # ── NPM Ecosystem ─────────────────────────────────────────────
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
+      - "javascript"
     commit-message:
       prefix: "chore(deps)"
     groups:
-      npm-minor-patch:
+      react-ecosystem:
         patterns:
-          - "*"
+          - "next*"
+          - "react*"
+          - "@types/react*"
         update-types:
           - "minor"
           - "patch"
 
+      dev-tools:
+        patterns:
+          - "eslint*"
+          - "@eslint*"
+          - "prettier*"
+          - "vitest*"
+          - "@vitest/*"
+          - "playwright*"
+          - "@playwright/*"
+          - "typescript"
+          - "@types/*"
+          - "@testing-library/*"
+          - "tailwindcss"
+          - "@tailwindcss/*"
+        update-types:
+          - "minor"
+          - "patch"
+
+      utilities:
+        patterns:
+          - "zod*"
+          - "date-fns*"
+          - "qrcode*"
+          - "jspdf*"
+          - "js-yaml*"
+          - "ioredis*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── Cargo Ecosystem (OphirPay Contract) ────────────────────────
   - package-ecosystem: "cargo"
     directory: "/contracts/ophirpay"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
+      - "rust"
     commit-message:
       prefix: "chore(deps)"
     groups:
-      cargo-ophirpay-minor-patch:
+      soroban-sdk:
         patterns:
-          - "*"
+          - "soroban-sdk*"
         update-types:
           - "minor"
           - "patch"
 
+      rust-tooling:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "soroban-sdk*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── Cargo Ecosystem (Emitter Contract) ─────────────────────────
   - package-ecosystem: "cargo"
     directory: "/contracts/emitter"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 3
-    labels:
-      - "dependencies"
-    commit-message:
-      prefix: "chore(deps)"
-    groups:
-      cargo-emitter-minor-patch:
-        patterns:
-          - "*"
-        update-types:
-          - "minor"
-          - "patch"
-
-  - package-ecosystem: "github-actions"
-    directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
+      - "rust"
     commit-message:
       prefix: "chore(deps)"
     groups:
-      actions-minor-patch:
+      soroban-sdk:
+        patterns:
+          - "soroban-sdk*"
+        update-types:
+          - "minor"
+          - "patch"
+
+      rust-tooling:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "soroban-sdk*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── GitHub Actions Ecosystem ──────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      github-actions:
         patterns:
           - "*"
         update-types:

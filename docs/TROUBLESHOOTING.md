@@ -5,7 +5,7 @@
 > and open a new one with the error message, your network (`TESTNET`/`PUBLIC`),
 > and the commands you ran.
 
-**Quick links:** [Setup & environment](#-setup--environment) · [Funding (friendbot)](#-funding--friendbot) · [RPC & network](#-rpc--network) · [Trustlines](#-trustlines) · [Wallet rejections](#-wallet-rejections) · [App runtime](#-app-runtime) · [Live events (SSE)](#-live-events-sse)
+**Quick links:** [Setup & environment](#-setup--environment) · [Funding (friendbot)](#-funding-friendbot) · [RPC & network](#-rpc--network) · [Trustlines](#-trustlines) · [Wallet rejections](#-wallet-rejections) · [App runtime](#-app-runtime) · [Live events (SSE)](#-live-events-sse) · [Prometheus alert runbooks](#-prometheus-alert-runbooks)
 
 ---
 
@@ -105,7 +105,7 @@ npm ci
 
 **Cause**: No `.env.local` / `.env.production` file.
 
-**Resolution**: `cp .env.example .env.local` and fill in the required values (see the [Deployment Guide](DEPLOYMENT.md#-environment-variables)). Restart the dev server — Next.js caches env at boot.
+**Resolution**: `cp .env.example .env.local` and fill in the required values (see the [Deployment Guide](DEPLOYMENT.md#environment-variables)). Restart the dev server — Next.js caches env at boot.
 
 ### `AUTH_SECRET is not set` at login
 
@@ -328,6 +328,74 @@ npm ci
 2. The WebSocket server starts automatically on boot via `instrumentation.ts` (`EVENTS_WS_PORT`, default `8787`); check the startup log for `WebSocket event server listening`.
 3. Confirm `ws(s)://<host>:8787/api/events` connects.
 4. In production, make sure the port is exposed through the ingress/load balancer.
+
+---
+
+## 🚨 Prometheus alert runbooks
+
+### Webhook High Failure Rate
+
+<a id="webhook-high-failure-rate"></a>
+
+**Alerts:** `WebhookDeliveryFailureRateHigh` (warning, >25% failures over 15m), `OphirPayWebhookHighFailureRate` (warning, >5% failures over 5m).
+
+**Symptom**: Webhook deliveries fail repeatedly, exceeding the allowed 5% threshold over a 5-minute rolling window or 25% threshold over a 15-minute window.
+
+**Cause**:
+- Subscriber endpoints are offline, returning 5xx or 429 status codes, or timing out.
+- TLS/SSL handshake failures or misconfigured endpoint URLs.
+- Delivery worker queue backlog or rate limiting by destination firewalls.
+
+**Resolution**:
+1. Inspect Prometheus counters `ophirpay_delivery_final_outcomes_total` and `ophirpay_delivery_attempts_total` to check failure rates and retry distributions.
+2. Review application logs for webhook dispatcher errors (`grep "webhook delivery failed"`).
+3. Verify subscriber endpoints via direct test ping (`POST /api/webhooks/test`).
+4. Check if the retry worker is processing retries smoothly without overwhelming downstream services.
+
+---
+
+### Soroban RPC Provider Degraded
+
+<a id="soroban-rpc-provider-degraded"></a>
+
+**Alerts:** `OphirPayRpcProviderDegraded` (critical, latency > 2.5s or 5xx returns for 3m), `RpcFailoverDegraded` (warning, running on fallback for >2m), `RpcFailoverFrequent` (warning, >=3 failovers in 30m).
+
+**Symptom**: Soroban RPC calls take more than 2.5 seconds (p95) or return 5xx server errors for 3 minutes.
+
+**Cause**:
+- Primary Soroban RPC provider is suffering from network congestion, degraded performance, or node outages.
+- Upstream rate limiting or node synchronization lag on the Stellar network.
+- Misconfigured RPC URL or network instability between the host and RPC provider.
+
+**Resolution**:
+1. Check `GET /api/health` and the `rpcFailover` status block to verify active endpoint and probe results.
+2. Verify Stellar network status at [status.stellar.org](https://status.stellar.org).
+3. If the primary RPC provider is persistently down, verify the automatic failover to the configured fallback endpoint (`FALLBACK_RPC_URLS`).
+4. Test RPC node reachability directly using `curl` against `NEXT_PUBLIC_STELLAR_RPC_URL` or fallback nodes.
+5. If necessary, update RPC provider configuration or rotate to a dedicated, high-availability RPC endpoint.
+
+---
+
+### Database Connection Pool Exhaustion
+
+<a id="database-connection-pool-exhaustion"></a>
+
+**Alerts:** `OphirPayDatabasePoolExhaustion` (critical, connection pool queue wait > 500ms for 1m).
+
+**Symptom**: Prisma database queries experience severe queue wait times (> 500ms) before acquiring a connection from the pool.
+
+**Cause**:
+- Connection pool size is too small for current traffic volume (`connection_limit` parameter in `DATABASE_URL`).
+- Long-running transactions or slow database queries holding pool connections open.
+- Connection leaks or unindexed queries causing query queues to back up.
+- Upstream database (PostgreSQL, Neon, Supabase) is under high load or PgBouncer pool limits reached.
+
+**Resolution**:
+1. Check active database queries and lock waits in the database engine (`pg_stat_activity`).
+2. Inspect `ophirpay_db_query_duration_seconds` to identify if slow queries are exhausting the pool.
+3. Review connection pool settings in `DATABASE_URL` (e.g., `connection_limit=20&pool_timeout=10`).
+4. If using pooled PostgreSQL (Neon/Supabase/PgBouncer), ensure `connection_limit` matches pooler concurrency limits.
+5. Restart or scale out database pooler if connection starvation persists.
 
 ---
 

@@ -151,9 +151,9 @@ function ensureRedis(): Promise<void> {
     try {
       // Dynamic import — ioredis is an optional dependency, and the app must
       // build and run without it installed.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod: any = await import("ioredis");
-      const client = new (mod.Redis ?? mod.default)(url, {
+      const mod = await import("ioredis");
+      const Redis = mod.Redis ?? mod.default;
+      const client = new Redis(url, {
         maxRetriesPerRequest: 3,
         lazyConnect: true,
         enableOfflineQueue: false,
@@ -164,7 +164,7 @@ function ensureRedis(): Promise<void> {
       // treats a Redis failure as a miss, so just record it quietly here.
       client.on?.("error", () => {});
       await client.connect();
-      redis = client as RedisLike;
+      redis = client;
       console.log("[api-cache] Using Redis backend");
     } catch (err) {
       redisUnavailable = true;
@@ -302,7 +302,19 @@ export async function invalidateCache(
   if (subject !== undefined) {
     const key = readCacheKey(scope, subject);
     store.delete(key);
-    await withRedis<unknown>((client) => client.del(key), null);
+    memoryDeleteByPrefix(`${key}:`);
+    await withRedis<unknown>(async (client) => {
+      await client.del(key);
+      const prefix = `${key}:`;
+      let cursor = "0";
+      for (let i = 0; i < MAX_SCAN_ITERATIONS; i++) {
+        const [next, keys] = await client.scan(cursor, "MATCH", `${prefix}*`, "COUNT", 100);
+        if (keys.length > 0) await client.del(...keys);
+        cursor = next;
+        if (cursor === "0") break;
+      }
+      return null;
+    }, null);
     return;
   }
 

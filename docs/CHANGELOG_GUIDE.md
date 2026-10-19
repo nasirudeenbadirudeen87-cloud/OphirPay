@@ -184,7 +184,7 @@ Style rules used across the existing changelog:
 - Use backticks for code identifiers: `record_payment`, `NEXT_PUBLIC_*`,
   `src/app/api/**/route.ts`.
 - Spell out numbers under 10 in prose; keep numeric literals for counts and
-  versions (`.nvmrc` → Node 20, 94 error variants).
+  versions (`.nvmrc` → Node 24, 94 error variants).
 - If the entry refers to error codes, contract functions, or env vars, the
   names must match the code exactly — reviewers will check.
 
@@ -282,9 +282,56 @@ user-facing:
       when the issue is not yet public
 - [ ] `npm run typecheck`, `npm run lint`, and `npm test` pass locally
 
-## 8. Links
+## 8. Automated Changelog Generator (`npm run changelog`)
+
+OphirPay provides an automated changelog generator script at [`scripts/generate-changelog.mjs`](../scripts/generate-changelog.mjs) (issue #1414). The script parses git history adhering to Conventional Commits ([`.commitlintrc.json`](../.commitlintrc.json)), classifies commits by type, automatically resolves PR numbers and contributor GitHub handles, and formats release notes matching `CHANGELOG.md` style.
+
+### Running the Generator
+
+```bash
+# Preview unreleased changes from recent commit history (dry-run):
+npm run changelog
+
+# Verify that git commits parse cleanly:
+node scripts/generate-changelog.mjs --check
+
+# Generate and write release notes for an upcoming version:
+npm run changelog -- --version 1.0.0 --write
+
+# Inspect commits from a specific tag or ref:
+node scripts/generate-changelog.mjs --from v0.1.0 --to HEAD --dry-run
+```
+
+### CLI Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--from <ref>` | Latest git tag or `HEAD~30` | Starting commit or tag |
+| `--to <ref>` | `HEAD` | Target commit or branch |
+| `--version <v>` | `Unreleased` | Version title for the generated release section |
+| `--date <date>` | Current date (`YYYY-MM-DD`) | Release date in ISO 8601 format |
+| `--repo <owner/repo>` | `OphirPay/OphirPay` | Target GitHub repository for PR/issue links |
+| `--write`, `-w` | `false` | Prepends/updates `CHANGELOG.md` directly |
+| `--dry-run` | `false` | Prints generated Markdown to stdout without writing |
+| `--check` | `false` | Validates git commit log parsing without modifying files |
+| `--help`, `-h` | — | Displays command-line help |
+
+### Classification Rules
+
+| Commit Type / Pattern | Changelog Category | Example |
+|---|---|---|
+| `BREAKING CHANGE:` / `type!:` | `### Breaking Changes` | `feat(auth)!: switch to bearer tokens` |
+| `feat:` / `feat(scope):` | `### Added` | `feat(send): add live Horizon fee tiers (#1373)` |
+| `fix:` / `fix(scope):` | `### Fixed` | `fix(cache): invalidate subject sub-keys` |
+| `fix(security):` / `security:` | `### Security` | `fix(security): rate-limit API keys (#1370)` |
+| `perf:` / `perf(scope):` | `### Performance` | `perf(prisma): add indexes on relation fields` |
+| `docs:` / `docs(scope):` | `### Documentation` | `docs: update troubleshooting guide` |
+| `refactor:`, `chore:`, `ci:`, `build:` | `### Changed` | `chore: bump dependencies` |
+
+## 9. Links
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — the changelog itself
+- [`scripts/generate-changelog.mjs`](../scripts/generate-changelog.mjs) — automated changelog generator script
 - [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — the convention this guide implements
 - [Semantic Versioning](https://semver.org/) — the versioning scheme
 - [Contributing Guide](../CONTRIBUTING.md) — the general contribution workflow

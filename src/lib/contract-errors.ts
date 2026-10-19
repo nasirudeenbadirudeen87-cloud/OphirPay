@@ -5,7 +5,7 @@
 /**
  * Soroban contract error decoding utilities.
  * Maps raw contract error codes to human-readable messages.
- * Mirrors the PaymentError enum in contracts/ophirpay/src/lib.rs.
+ * Mirrors the PaymentError enum in contracts/ophirpay/src/errors.rs.
  */
 
 export const CONTRACT_ERROR_MAP: Record<string, string> = {
@@ -316,6 +316,15 @@ export const CONTRACT_ERROR_MAP: Record<string, string> = {
   "305": "No pending ownership transfer",
   "306": "Math overflow",
   "307": "Stream accounting invariant violated: refused to pay an inconsistent amount",
+  "308": "Pause scope not recognized: unknown scope identifier",
+  "309": "Idempotency key was reused for a different payment payload",
+  "310": "Stream duration is too short: minimum duration is 60 seconds",
+  "311": "Stream duration is too long: maximum duration is 5 years",
+  "312": "Payment amount violates token decimal precision constraints",
+  "313": "Payment memo exceeds maximum length or contains invalid control characters",
+  "314": "Threshold cannot be zero or exceed signer count",
+  "315": "Signers list cannot be empty",
+  "316": "Dispute cooling-off period is still active",
 };
 
 /**
@@ -346,5 +355,5 @@ export function decodeContractError(rawError: string): string {
 export function getContractErrorCatalog(): { code: string; message: string }[] {
   return Object.entries(CONTRACT_ERROR_MAP)
     .map(([code, message]) => ({ code, message }))
-    .sort((a, b) => parseInt(a.code) - parseInt(b.code));
+    .sort((a, b) => parseInt(a.code, 10) - parseInt(b.code, 10));
 }

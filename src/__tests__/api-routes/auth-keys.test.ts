@@ -4,17 +4,40 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createHash } from "node:crypto";
 
 // Mock dependencies
+//
+// Key creation runs inside a Serializable transaction (issue #1370), so the
+// transaction client and the top-level client share the same record mocks —
+// assertions on `prisma.apiKey.create` still describe what happened inside
+// the transaction.
+const prismaMocks = vi.hoisted(() => {
+  const apiKeyCreate = vi.fn();
+  const apiKeyCount = vi.fn().mockResolvedValue(0);
+  const auditCreate = vi.fn().mockResolvedValue({});
+  const tx = {
+    apiKey: { count: apiKeyCount, create: apiKeyCreate },
+    auditLog: { create: auditCreate },
+  };
+  return { apiKeyCreate, apiKeyCount, auditCreate, tx };
+});
+
 vi.mock("@/lib/prisma", () => ({
   default: {
     apiKey: {
       findMany: vi.fn(),
-      create: vi.fn(),
+      create: prismaMocks.apiKeyCreate,
       deleteMany: vi.fn(),
+      updateMany: vi.fn(),
+      count: prismaMocks.apiKeyCount,
     },
+    auditLog: { create: prismaMocks.auditCreate },
     user: {
       findUnique: vi.fn(),
       upsert: vi.fn(),
     },
+    $transaction: vi.fn(
+      (callback: (transaction: typeof prismaMocks.tx) => Promise<unknown>) =>
+        callback(prismaMocks.tx)
+    ),
   },
 }));
 
@@ -23,6 +46,9 @@ vi.mock("@/lib/auth-session", async (importOriginal) => {
   return {
     ...actual,
     getAuthContext: vi.fn(),
+    // Rolling renewal (#1399) is asserted directly; proxy through to the real
+    // implementation by default so unaffected cases keep real behaviour.
+    sessionNeedsRenewal: vi.fn(actual.sessionNeedsRenewal),
   };
 });
 
@@ -142,7 +168,26 @@ describe("API Routes: Auth, CSRF & Keys", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.data.authenticated).toBe(true);
-      expect(res.headers.get("Set-Cookie")).toContain("ophirpay_session");
+      // A session with more than half its TTL left is not reissued — rolling
+      // renewal only kicks in on the threshold (#1399).
+      expect(authSession.sessionNeedsRenewal).toHaveBeenCalled();
+      expect(res.headers.get("Set-Cookie")).toBeNull();
+    });
+
+    it("rolls the cookie forward once less than half the session TTL remains", async () => {
+      vi.mocked(authSession.sessionNeedsRenewal).mockReturnValueOnce(true);
+      const cookieHeader = `ophirpay_session=${authSession.createSessionToken(VALID_STELLAR_PK, "TESTNET")}`;
+      const req = new Request("http://localhost/api/auth/session", {
+        method: "POST",
+        headers: { cookie: cookieHeader },
+        body: JSON.stringify({ publicKey: VALID_STELLAR_PK, network: "TESTNET" }),
+      });
+      const res = await postSession(req);
+      expect(res.status).toBe(200);
+      const setCookie = res.headers.get("Set-Cookie");
+      expect(setCookie).toContain("ophirpay_session");
+      expect(setCookie).toContain("SameSite=Strict");
+      expect(setCookie).toContain("Max-Age=");
     });
 
     it("returns 401 when challenge verification fails", async () => {
@@ -278,8 +323,9 @@ describe("API Routes: Auth, CSRF & Keys", () => {
       expect(res.status).toBe(201);
       const data = await res.json();
       expect(data.data.id).toBe("key_created_1");
-      // Issue #701: 32 CSPRNG bytes (64 hex) behind the oph_ prefix.
-      expect(data.data.key).toMatch(/^oph_[a-f0-9]{64}$/);
+      expect(data.data.key).toMatch(
+        /^(op_(?:live|test)_[0-9a-f]{64}_[0-9a-f]{8}|oph_[a-f0-9]{64})$/
+      );
 
       const createArgs = vi.mocked(prisma.apiKey.create).mock.calls[0]![0] as {
         data: { keyHash: string; prefix: string };
@@ -309,7 +355,7 @@ describe("API Routes: Auth, CSRF & Keys", () => {
 
     it("DELETE returns 400 when key is not found or not owned by user", async () => {
       vi.mocked(authSession.getAuthContext).mockResolvedValueOnce({ userId: "u123" });
-      vi.mocked(prisma.apiKey.deleteMany).mockResolvedValueOnce({ count: 0 });
+      vi.mocked(prisma.apiKey.updateMany).mockResolvedValueOnce({ count: 0 });
 
       const res = await deleteKeys(
         new Request("http://localhost/api/keys?id=nonexistent", { method: "DELETE" })
@@ -321,7 +367,7 @@ describe("API Routes: Auth, CSRF & Keys", () => {
 
     it("DELETE successfully deletes key", async () => {
       vi.mocked(authSession.getAuthContext).mockResolvedValueOnce({ userId: "u123" });
-      vi.mocked(prisma.apiKey.deleteMany).mockResolvedValueOnce({ count: 1 });
+      vi.mocked(prisma.apiKey.updateMany).mockResolvedValueOnce({ count: 1 });
 
       const res = await deleteKeys(
         new Request("http://localhost/api/keys?id=k1", { method: "DELETE" })

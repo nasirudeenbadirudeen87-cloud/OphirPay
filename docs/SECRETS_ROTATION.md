@@ -38,6 +38,7 @@
 | 12 | `AWS_REGION` | AWS region for S3 operations. | **Low** | GitHub Actions Secrets |
 | 13 | `NEXT_PUBLIC_SENTRY_DSN` | Sentry error-tracking DSN. Low risk (DSNs are public in client bundles). | **Low** | Vercel env |
 | 14 | `NEXT_PUBLIC_GA_ID` | Google Analytics measurement ID. Public by design. | **Info** | Vercel env |
+| 15 | `RESEND_API_KEY` | API key for the Resend HTTPS API used by `src/lib/email.ts` to deliver transactional email. Exposure lets anyone send mail from your verified domain. | **High** | Vercel env / K8s Secret / `.env.local` |
 
 > **Not secrets** (public by design, do not rotate):
 > `NEXT_PUBLIC_STELLAR_NETWORK`, `NEXT_PUBLIC_STELLAR_RPC_URL`,
@@ -61,6 +62,7 @@ Set in **Vercel Dashboard → Settings → Environment Variables** (Production):
 | `AUTH_SECRET` | Generate with `openssl rand -hex 32` |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `DIRECT_DATABASE_URL` | For Prisma migrations (when using connection pooling) |
+| `RESEND_API_KEY` | Transactional email — create at <https://resend.com/api-keys> |
 | `NEXT_PUBLIC_SENTRY_DSN` | Optional — Sentry DSN |
 
 ### 2.2 Kubernetes / Helm
@@ -407,15 +409,18 @@ non-breaking.
 
 ### 7.3 Rotation
 
-API keys are rotated per user, not per deployment:
+API keys are rotated per user, not per deployment. Use **Rotate** in the API
+Keys page or call `POST /api/keys/<keyId>/rotate`. The replacement inherits
+the existing key's name, scopes, and expiry and is returned once. The old key
+remains valid for up to 24 hours so callers can deploy the replacement; if the
+old key was due to expire sooner, that earlier expiry is preserved. The old
+key's rotation link and audit event are retained, and its request logs are not
+deleted.
 
-1. Mint a replacement with `POST /api/keys` (the raw key is returned once).
-2. Switch the caller to the new key.
-3. Revoke the old key with `DELETE /api/keys?id=<keyId>`.
-
-Revocation is immediate — the key row is deleted, so auth fails closed on the
-next request. Use `lastUsed` (GET `/api/keys`) to confirm a key is no longer
-in use before revoking it.
+After deployment, use **Revoke** (or
+`DELETE /api/keys?id=<keyId>`) to disable the old key immediately. For
+suspected compromise, revoke immediately instead of using the overlap period.
+`lastUsed` remains available on the key record while the overlap is active.
 
 ---
 

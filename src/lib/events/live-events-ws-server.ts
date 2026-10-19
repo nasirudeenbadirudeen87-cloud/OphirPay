@@ -9,6 +9,8 @@
  * transports deliver the identical event stream. When this server isn't
  * reachable (e.g. serverless deploys), the client automatically falls back
  * to the SSE route.
+ *
+ * @see docs/WEBSOCKET.md for protocol, message schemas, and deployment specs.
  */
 
 import http from "node:http";
@@ -35,9 +37,17 @@ export interface WsServerOptions {
   path?: string;
   /** Protocol-level keepalive interval. */
   heartbeatMs?: number;
+  /**
+   * Per-client outbound ceiling in bytes before the slow-consumer policy
+   * disconnects the socket (issue #744). Default 256 KiB.
+   */
+  maxBufferedBytes?: number;
   /** Injectable source factory for tests. */
   eventSourceFactory?: () => LiveEventSource;
 }
+
+/** Default per-client outbound buffer ceiling (bytes). */
+export const WS_MAX_BUFFERED_BYTES = 256 * 1024;
 
 interface WsClient {
   socket: Duplex;
@@ -95,12 +105,35 @@ export class LiveEventsWsServer {
 
   /**
    * Broadcast a message to every connected client.
+   *
+   * Each write is bounded (issue #744): a socket whose outbound buffer has
+   * already exceeded the ceiling is treated as a slow consumer and dropped,
+   * so one stalled client cannot grow the server's memory without bound.
    */
   broadcast(payload: string): void {
     const frame = encodeFrame(OPCODE_TEXT, payload);
     for (const client of this.clients) {
-      client.socket.write(frame);
+      this.sendFrame(client, frame);
     }
+  }
+
+  private get maxBufferedBytes(): number {
+    return this.options.maxBufferedBytes ?? WS_MAX_BUFFERED_BYTES;
+  }
+
+  /** Write a frame, disconnecting the client when its buffer is over budget. */
+  private sendFrame(client: WsClient, frame: Buffer): void {
+    const buffered = client.socket.writableLength ?? 0;
+    if (buffered + frame.length > this.maxBufferedBytes) {
+      this.clients.delete(client);
+      try {
+        client.socket.destroy();
+      } catch {
+        /* already gone */
+      }
+      return;
+    }
+    client.socket.write(frame);
   }
 
   /**
@@ -120,7 +153,7 @@ export class LiveEventsWsServer {
           continue;
         }
         client.alive = false;
-        client.socket.write(encodeFrame(OPCODE_PING, Buffer.alloc(0)));
+        this.sendFrame(client, encodeFrame(OPCODE_PING, Buffer.alloc(0)));
       }
     }, this.options.heartbeatMs ?? 30000);
   }
